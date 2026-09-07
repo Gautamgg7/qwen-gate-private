@@ -249,6 +249,7 @@ async release(
     accountEmail?: string,
     isSuccess: boolean = true,
     conversationKey?: string,
+    skipHealthTracking: boolean = false,
   ): Promise<void> {
     if (!this.activeSessions.has(chatId)) return;
 
@@ -261,11 +262,16 @@ async release(
 
     if (accountEmail) {
       decrementInFlight(accountEmail);
-      if (isSuccess) {
-        incrementTotalRequests(accountEmail);
-        recordAccountSuccess(accountEmail);
-      } else {
-        recordAccountFailure(accountEmail);
+      // skipHealthTracking: when true, don't record success/failure on the
+      // account — used for WAF challenges (bx-token issue, not account issue),
+      // timeouts, and other transient errors where the account itself is fine.
+      if (!skipHealthTracking) {
+        if (isSuccess) {
+          incrementTotalRequests(accountEmail);
+          recordAccountSuccess(accountEmail);
+        } else {
+          recordAccountFailure(accountEmail);
+        }
       }
     }
 

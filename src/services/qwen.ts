@@ -110,7 +110,10 @@ const cachedTimezone = 'America/Sao_Paulo';
 
 export function createFetchTimeout(): { controller: AbortController; cleanup: () => void } {
   const controller = new AbortController();
-  const timeout = config.getInt('QWEN_FETCH_TIMEOUT_MS', 30000);
+  // Bumped from 30s → 60s. The 30s default was too short for /files/parse
+  // (Qwen's file parsing endpoint can take 20-40s under load), and the
+  // worker's own AbortSignal.timeout(60) makes the upstream cap match this.
+  const timeout = config.getInt('QWEN_FETCH_TIMEOUT_MS', 60000);
   if (timeout > 0) {
     const timer = setTimeout(() => controller.abort(new Error('Request timed out')), timeout);
     return { controller, cleanup: () => clearTimeout(timer) };
@@ -391,40 +394,76 @@ export async function createQwenStream(
     });
     lastDebugEntryId = debugEntry.id;
 
-    const response = await browserlessFetch(url, {
-      method: 'POST',
-      headers: {
-        accept: 'application/json, text/plain, */*',
-        'accept-language': 'en-US,en;q=0.9',
-        'content-type': 'application/json',
-        version: '0.2.66', // Qwen SPA version — required or Qwen returns Bad_Request
-        source: 'web',
-        cookie: cookieStr,
-        origin: QWEN_API_BASE,
-        referer: chatId ? `https://chat.qwen.ai/c/${chatId}` : 'https://chat.qwen.ai/',
-        'sec-ch-ua': '"Chromium";v="142", "Google Chrome";v="142", "Not?A_Brand";v="99"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Linux"',
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
-        'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
-        'x-accel-buffering': 'no',
-        'x-request-id': crypto.randomUUID(),
-        timezone: cachedTimezone,
-      },
-      body: bodyStr,
-      accountEmail: currentAccountEmail,
-      stream: true, // keep session alive for streaming via impers worker
-    });
-    logStore.log(
-      'debug',
-      'qwen',
-      `[Qwen] Fetch response status=${response.status} ok=${response.ok} account=${currentAccountEmail || '?'}`,
-    );
-    recordResponse(lastDebugEntryId, response);
-    logUsage(currentAccountEmail, model);
-    return { response, headers: {}, qwenLogFile: makeRequestQwenLogFile };
+    try {
+      const response = await browserlessFetch(url, {
+        method: 'POST',
+        headers: {
+          accept: 'application/json, text/plain, */*',
+          'accept-language': 'en-US,en;q=0.9',
+          'content-type': 'application/json',
+          version: '0.2.66', // Qwen SPA version — required or Qwen returns Bad_Request
+          source: 'web',
+          cookie: cookieStr,
+          origin: QWEN_API_BASE,
+          referer: chatId ? `https://chat.qwen.ai/c/${chatId}` : 'https://chat.qwen.ai/',
+          'sec-ch-ua': '"Chromium";v="142", "Google Chrome";v="142", "Not?A_Brand";v="99"',
+          'sec-ch-ua-mobile': '?0',
+          'sec-ch-ua-platform': '"Linux"',
+          'sec-fetch-dest': 'empty',
+          'sec-fetch-mode': 'cors',
+          'sec-fetch-site': 'same-origin',
+          'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36',
+          'x-accel-buffering': 'no',
+          'x-request-id': crypto.randomUUID(),
+          timezone: cachedTimezone,
+        },
+        body: bodyStr,
+        accountEmail: currentAccountEmail,
+        stream: true, // keep session alive for streaming via impers worker
+      });
+      logStore.log(
+        'debug',
+        'qwen',
+        `[Qwen] Fetch response status=${response.status} ok=${response.ok} account=${currentAccountEmail || '?'}`,
+      );
+      recordResponse(lastDebugEntryId, response);
+      logUsage(currentAccountEmail, model);
+      return { response, headers: {}, qwenLogFile: makeRequestQwenLogFile };
+    } catch (err: any) {
+      // ── Browser fallback for WAF baxia challenges ────────────────────
+      // When the browserless wreq-js worker gets blocked by Qwen's WAF
+      // (FAIL_SYS_USER_VALIDATE / RGV587_ERROR), fall back to making the
+      // request via the authenticated cloakbrowser profile. The browser has
+      // the real AWSC fireyejs.js loaded which generates proper bx-ua/bx-pp
+      // tokens per-request that bypass the WAF.
+      const errMsg = err?.message || '';
+      const isWafError = errMsg.includes('FAIL_SYS_USER_VALIDATE') ||
+                        errMsg.includes('WAF') ||
+                        errMsg.includes('RGV587_ERROR');
+      if (isWafError && currentAccountEmail) {
+        try {
+          const { isBrowserFallbackAvailable, browserChatFetch } = await import('./browserChatFetch.ts');
+          if (isBrowserFallbackAvailable(currentAccountEmail)) {
+            logStore.log('info', 'qwen', `[Qwen] WAF detected — falling back to browser chat fetch for ${currentAccountEmail}`);
+            const browserResult = await browserChatFetch(currentAccountEmail, url, payload, cookieStr);
+            logStore.log('info', 'qwen', `[Qwen] Browser fallback returned status=${browserResult.status}`);
+            // Build a Response object from the browser stream
+            const responseInit: ResponseInit = {
+              status: browserResult.status || 200,
+              headers: browserResult.headers,
+            };
+            const response = new Response(browserResult.stream as any, responseInit);
+            (response as any)._wreqClose = () => {};
+            recordResponse(lastDebugEntryId, response);
+            logUsage(currentAccountEmail, model);
+            return { response, headers: browserResult.headers, qwenLogFile: makeRequestQwenLogFile };
+          }
+        } catch (fallbackErr: any) {
+          logStore.log('warn', 'qwen', `[Qwen] Browser fallback failed: ${fallbackErr?.message || fallbackErr}`);
+        }
+      }
+      throw err;
+    }
   };
 
   let result: { response: Response; headers: Record<string, string>; qwenLogFile?: string };

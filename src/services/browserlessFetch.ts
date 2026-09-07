@@ -129,7 +129,7 @@ const wafCheck = (r: Response): boolean => {
 // {"ret":["FAIL_SYS_USER_VALIDATE",...]} instead of 302/403/HTML. wafCheck()
 // misses those, the "successful" response carries zero data frames, and the
 // client sees an empty stream. This sniffs the body for the WAF signature.
-const WAF_BODY_RE = /FAIL_SYS_USER_VALIDATE|aliyun_waf/i;
+const WAF_BODY_RE = /FAIL_SYS_USER_VALIDATE|aliyun_waf|RGV587_ERROR|_____tmd_____|x5secdata/i;
 
 interface WafBodyResult {
   waf: boolean;
@@ -288,8 +288,104 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
     const elapsed = Date.now() - startTime;
     logStore.log('debug', 'browserless', `${method} ${url.split('?')[0]} → ${response.status} (${elapsed}ms)`);
 
-    // For streaming: stash noop close function so qwen.ts doesn't break
+    // ─── WAF-in-body sniffing for STREAMING requests ─────────────────
+    // For stream: true, the response content-type is normally text/event-stream
+    // — but if Qwen bounces the request as a WAF challenge, the content-type
+    // is application/json and the body contains:
+    //   {"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::..."],"data":{"url":"..."}}
+    // Without sniffing, this passes through and the client sees an empty stream
+    // (no data frames). Sniff the body when content-type is JSON (not SSE),
+    // detect WAF, and try a browser-based cookie refresh + fresh bx tokens retry.
     if (stream) {
+      const ct = (response.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('application/json') || ct.includes('text/plain') || ct.includes('text/html')) {
+        const sniffed = await sniffResponseForWaf(response, true);
+        if (sniffed.waf) {
+          logStore.log('warn', 'browserless', `WAF-in-body detected on streaming ${url.split('?')[0]} — trying browser cookie refresh before retry`);
+          // Try browser-based cookie refresh (same as wafCheck() path)
+          const currentCookie = headers['cookie'] || '';
+          const key = accountEmail || '_default_';
+          let promise = cookieRefreshInFlight.get(key);
+          if (!promise) {
+            promise = refreshCookiesViaBrowser(currentCookie).finally(() => {
+              cookieRefreshInFlight.delete(key);
+            });
+            cookieRefreshInFlight.set(key, promise);
+          }
+          const freshCookies = await promise;
+          if (freshCookies) {
+            headers['cookie'] = freshCookies;
+            tokenCache.delete('bx-ua');
+            tokenCache.delete('bx-pp');
+            tokenCache.delete('acw_tc');
+            resetBxUaCache();
+            await ensureBxUmidtoken(headers);
+            headers['bx-ua'] = (await generateBxUa()) || headers['bx-ua'];
+            const pp = await generateBxPp(body);
+            if (pp) headers['bx-pp'] = pp;
+            logStore.log('info', 'browserless', `Retrying streaming ${url.split('?')[0]} with fresh browser cookies...`);
+            try {
+              response = await wreqFetch(url, {
+                method,
+                headers,
+                body,
+                signal,
+                stream: !!stream,
+                debugLogDir: process.env.DEBUG_IMPERS_DIR,
+              });
+              // Re-check the retry response for WAF
+              const retryCt = (response.headers.get('content-type') || '').toLowerCase();
+              if (!retryCt.includes('text/event-stream')) {
+                const retrySniffed = await sniffResponseForWaf(response, true);
+                if (retrySniffed.waf) {
+                  logStore.log('warn', 'browserless', `WAF-in-body persists on streaming retry of ${url.split('?')[0]} — invalidating bx tokens for outer retry`);
+                  tokenCache.delete('bx-ua');
+                  tokenCache.delete('bx-pp');
+                  tokenCache.delete('acw_tc');
+                  resetBxUaCache();
+                  throw new Error(`403 WAF challenge in streaming response body (FAIL_SYS_USER_VALIDATE) for ${url.split('?')[0]} — retry with fresh tokens`);
+                }
+                // Return the rebuilt response (with text body if non-SSE)
+                return retrySniffed.response;
+              }
+              // For text/event-stream: stash noop close
+              (response as any)._wreqClose = () => {};
+              return response;
+            } catch (retryErr) {
+              // Retry failed — invalidate tokens and re-throw so outer retry loop catches it
+              tokenCache.delete('bx-ua');
+              tokenCache.delete('bx-pp');
+              tokenCache.delete('acw_tc');
+              resetBxUaCache();
+              throw retryErr;
+            }
+          }
+          // Browser refresh failed — invalidate tokens and throw
+          tokenCache.delete('bx-ua');
+          tokenCache.delete('bx-pp');
+          tokenCache.delete('acw_tc');
+          resetBxUaCache();
+          throw new Error(`403 WAF challenge in streaming response body (FAIL_SYS_USER_VALIDATE) for ${url.split('?')[0]} — browser refresh failed`);
+        }
+        // Even if not WAF, if response is JSON (not SSE) for a streaming request,
+        // it's likely an error envelope — surface it as a normal error so the
+        // client sees the error message instead of an empty stream.
+        const bodyText = await sniffed.response.text().catch(() => '');
+        if (bodyText && !bodyText.startsWith('data:')) {
+          logStore.log('warn', 'browserless', `Non-SSE response on streaming request to ${url.split('?')[0]} — content-type=${ct}, bodyLen=${bodyText.length}`);
+          // Rebuild as a normal text response so the chat handler can see it
+          const rebuilt = new Response(bodyText, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: { 'content-type': ct || 'application/json' },
+          });
+          (rebuilt as any)._wreqClose = () => {};
+          return rebuilt;
+        }
+        // If it WAS SSE data, return the rebuilt response
+        return sniffed.response;
+      }
+      // For text/event-stream: stash noop close function so qwen.ts doesn't break
       (response as any)._wreqClose = () => {
         // Worker creates fresh session per request — nothing to close.
       };

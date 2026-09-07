@@ -244,7 +244,17 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
   let lastError: any;
 
   for (let attempt = 0; attempt < MAX_ACCOUNT_RETRIES; attempt++) {
-    const selectedAccount = await pickAccount(lastFailedEmail);
+    // pickAccount may return null if lastFailedEmail excludes all accounts.
+    // In single-account setups (or when only one account is healthy), retry
+    // without excluding the last failed account — the issue may be a transient
+    // WAF challenge (bx-token issue, not account issue) that just needs a
+    // fresh token + brief backoff.
+    let selectedAccount = await pickAccount(lastFailedEmail);
+    if (!selectedAccount && lastFailedEmail) {
+      // No other accounts available — retry the same account with fresh tokens
+      logStore.log('warn', 'chat', `[Chat] No other accounts available — retrying with ${lastFailedEmail} (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES})`);
+      selectedAccount = await pickAccount();
+    }
     const accountEmail = selectedAccount?.email;
     if (!selectedAccount && attempt > 0) {
       // On retry: if still no accounts, all are throttled — stop retrying
@@ -339,8 +349,14 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         body.tool_choice,
       );
     } catch (err: any) {
-      // Release the acquired session to prevent pool exhaustion + inFlight leak
-      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+      // Release the acquired session to prevent pool exhaustion + inFlight leak.
+      // For WAF/bot-detection errors, skip health tracking — it's a bx-token
+      // issue, not an account issue, and we don't want to degrade the only
+      // account in single-account setups.
+      const isWafError = (err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
+                         (err.message || '').includes('WAF') ||
+                         (err.message || '').includes('RGV587_ERROR');
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, undefined, isWafError);
 
       logStore.log(
         'debug',
@@ -355,16 +371,25 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         lastError = err;
         continue;
       }
-      // Bot detection / CAPTCHA: Qwen rejected BEFORE processing (safe to retry on another account).
-      // Throttle the detected account so pickAccount won't pick it again.
+      // Bot detection / CAPTCHA: Qwen rejected BEFORE processing (safe to retry).
+      // WAF (FAIL_SYS_USER_VALIDATE) is a bx-token issue, NOT an account issue —
+      // don't throttle the account, just invalidate bx tokens and retry.
+      // For an actual CAPTCHA (rare), throttling makes sense, but FAIL_SYS_USER_VALIDATE
+      // is far more common and shouldn't lock out the only account in a 1-account setup.
       if (
         (err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
+        (err.message || '').includes('WAF') ||
         (err.message || '').includes('CAPTCHA') ||
         err instanceof RetryableQwenStreamError
       ) {
         lastFailedEmail = resolvedEmail;
         lastError = err;
-        if (resolvedEmail) throttleAccount(resolvedEmail, 5 * 60 * 1000);
+        // Only throttle for actual CAPTCHA (baxia asking user to solve a puzzle),
+        // not for FAIL_SYS_USER_VALIDATE (bx-token regeneration needed)
+        const isActualCaptcha = (err.message || '').includes('CAPTCHA') && !(err.message || '').includes('FAIL_SYS_USER_VALIDATE');
+        if (isActualCaptcha && resolvedEmail) throttleAccount(resolvedEmail, 5 * 60 * 1000);
+        // For WAF: brief backoff so bx tokens regenerate before next attempt
+        if (!isActualCaptcha) await new Promise((r) => setTimeout(r, 1500));
         continue;
       }
       // Timeout / slow response: Qwen didn't respond in time — skip to next account without penalty
@@ -485,10 +510,67 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     let sawRealData = hasRealSseData(probeText);
     const PROBE_DEADLINE_MS = 20_000;
     const probeDeadline = Date.now() + PROBE_DEADLINE_MS;
+    let probeDataFrameCount = 0;
+    let probeTextAccumulated = probeText;
+    // ── Early WAF-in-stream detection ──────────────────────────────────
+    // Qwen's baxia WAF sometimes returns HTTP 200 + application/json body
+    // with {"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::..."],...}
+    // — this looks like real data to hasRealSseData (the JSON object has
+    // choices/ret/etc.), but it's actually a bot-detection error. Catch it
+    // here so the retry loop kicks in with fresh bx tokens.
+    const probeLooksLikeWaf = (text: string): boolean => {
+      if (!text) return false;
+      // Match the baxia error pattern (response is JSON, not SSE)
+      if (text.includes('FAIL_SYS_USER_VALIDATE')) return true;
+      if (text.includes('RGV587_ERROR')) return true;
+      if (text.includes('_____tmd_____/punish')) return true;
+      if (text.includes('x5secdata')) return true;
+      return false;
+    };
+    if (probeLooksLikeWaf(probeText)) {
+      logStore.log('warn', 'chat', `[Chat] WAF baxia challenge detected in stream from ${resolvedEmail} (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES}). Body: ${JSON.stringify(probeText.slice(0, 400))}`);
+      logStore.addError(logId, `WAF baxia challenge (FAIL_SYS_USER_VALIDATE) from ${resolvedEmail}`);
+      // Invalidate bx tokens for fresh retry — WAF is a token issue, not an
+      // account issue. Don't throttle the account (only 1-account setups would
+      // otherwise immediately exhaust). Just invalidate bx-ua/bx-pp/acw_tc and
+      // try the next account with freshly generated tokens.
+      try {
+        const { resetBxUaCache } = await import('../services/fireyejsRunner.ts');
+        resetBxUaCache();
+      } catch { /* best effort */ }
+      streamReader.cancel().catch(() => {});
+      qwenAbortController?.abort();
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, undefined, true);
+      lastFailedEmail = resolvedEmail;
+      lastError = new Error(`WAF baxia challenge (FAIL_SYS_USER_VALIDATE) for ${resolvedEmail}`);
+      // Brief backoff so the next attempt generates fresh bx tokens
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
     while (!sawRealData) {
       const remainingMs = probeDeadline - Date.now();
       if (remainingMs <= 0) {
         logStore.log('warn', 'chat', `[Chat] Content probe deadline hit (${PROBE_DEADLINE_MS / 1000}s, no data frame) from ${resolvedEmail}`);
+        break;
+      }
+      // Check for WAF baxia challenge on each iteration too (in case body
+      // arrives in multiple chunks)
+      if (probeLooksLikeWaf(probeTextAccumulated)) {
+        logStore.log('warn', 'chat', `[Chat] WAF baxia challenge detected mid-probe from ${resolvedEmail} (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES}). Body: ${JSON.stringify(probeTextAccumulated.slice(0, 400))}`);
+        logStore.addError(logId, `WAF baxia challenge (FAIL_SYS_USER_VALIDATE) from ${resolvedEmail}`);
+        try {
+          const { resetBxUaCache } = await import('../services/fireyejsRunner.ts');
+          resetBxUaCache();
+        } catch { /* best effort */ }
+        streamReader.cancel().catch(() => {});
+        qwenAbortController?.abort();
+        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, undefined, true);
+        lastFailedEmail = resolvedEmail;
+        lastError = new Error(`WAF baxia challenge (FAIL_SYS_USER_VALIDATE) for ${resolvedEmail}`);
+        await new Promise((r) => setTimeout(r, 1000));
+        // Force outer loop to retry with a different account
+        sawRealData = false;
+        // Break out of the probe loop and let the outer continue handle it
         break;
       }
       const probeResult: any = await Promise.race([
@@ -497,10 +579,99 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       ]);
       if (probeResult.value) {
         probeChunks.push(probeResult.value);
-        probeText += probeDecoder.decode(probeResult.value, { stream: true });
+        const newText = probeDecoder.decode(probeResult.value, { stream: true });
+        probeText += newText;
+        probeTextAccumulated += newText;
         sawRealData = hasRealSseData(probeText);
+        if (sawRealData) probeDataFrameCount++;
       }
       if (probeResult.done) break; // upstream ended (or deadline) with no data frame
+    }
+    // Re-check WAF after probe finished (in case WAF arrived in last chunk)
+    if (probeLooksLikeWaf(probeTextAccumulated)) {
+      logStore.log('warn', 'chat', `[Chat] WAF baxia challenge detected post-probe from ${resolvedEmail} (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES}). Body: ${JSON.stringify(probeTextAccumulated.slice(0, 400))}`);
+      logStore.addError(logId, `WAF baxia challenge (FAIL_SYS_USER_VALIDATE) from ${resolvedEmail}`);
+      try {
+        const { resetBxUaCache } = await import('../services/fireyejsRunner.ts');
+        resetBxUaCache();
+      } catch { /* best effort */ }
+      streamReader.cancel().catch(() => {});
+      qwenAbortController?.abort();
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, undefined, true);
+      lastFailedEmail = resolvedEmail;
+      lastError = new Error(`WAF baxia challenge (FAIL_SYS_USER_VALIDATE) for ${resolvedEmail}`);
+      await new Promise((r) => setTimeout(r, 1000));
+      continue;
+    }
+    // ── Deep empty-stream detection (deeper than hasRealSseData) ──────
+    // Qwen sometimes sends a series of SSE data frames with empty deltas
+    // (e.g. {choices:[{delta:{content:""}}]} or {choices:[{delta:{phase:"answer",
+    // content:""}}]}) followed by [DONE]. The basic hasRealSseData() check
+    // passes (any delta counts as "real data"), but the stream carries ZERO
+    // usable content. This caused the "empty result" warnings in the live
+    // logs after stream completion.
+    // Solution: scan all probed data frames for any non-empty content,
+    // reasoning_content, or local_mcp tool calls. If ALL data frames had
+    // empty content (no actual text emitted), treat as empty response and
+    // retry on the next account.
+    if (sawRealData) {
+      const hasNonEmptyContent = (text: string): boolean => {
+        for (const line of text.split('\n')) {
+          const l = line.trim();
+          if (!l.startsWith('data:')) continue;
+          const payload = l.slice(5).trim();
+          if (!payload || payload === '[DONE]') continue;
+          try {
+            const obj = JSON.parse(payload);
+            const delta = obj?.choices?.[0]?.delta;
+            if (!delta) continue;
+            // Has actual answer content
+            if (typeof delta.content === 'string' && delta.content.length > 0) return true;
+            // Has reasoning content
+            if (typeof delta.reasoning_content === 'string' && delta.reasoning_content.length > 0) return true;
+            // Has thinking content via extra.summary_thought
+            const summaryContent = delta?.extra?.summary_thought?.content;
+            if (Array.isArray(summaryContent) && summaryContent.length > 0) return true;
+            // Has tool calls
+            if (delta?.extra?.local_mcp) return true;
+            // Has usage info only — keep going (might be mid-stream)
+          } catch {
+            /* partial JSON line — keep probing */
+          }
+        }
+        return false;
+      };
+      // Wait a bit more for actual content if we only saw framing-only data frames
+      if (!hasNonEmptyContent(probeTextAccumulated)) {
+        // Give Qwen a short grace period (5s) — sometimes the first data frames
+        // are pure "phase" markers and the real content arrives 1-2 frames later.
+        let graceSawContent = false;
+        const graceDeadline = Date.now() + 5_000;
+        while (!graceSawContent && Date.now() < graceDeadline) {
+          const remainingMs = graceDeadline - Date.now();
+          const graceResult: any = await Promise.race([
+            streamReader.read(),
+            new Promise((resolve) => setTimeout(() => resolve({ done: true, value: undefined }), remainingMs)),
+          ]);
+          if (graceResult.value) {
+            probeChunks.push(graceResult.value);
+            const newText = probeDecoder.decode(graceResult.value, { stream: true });
+            probeTextAccumulated += newText;
+            if (hasNonEmptyContent(newText)) {
+              graceSawContent = true;
+            }
+          }
+          if (graceResult.done) break;
+        }
+        if (!graceSawContent) {
+          logStore.log(
+            'warn',
+            'chat',
+            `[Chat] Empty SSE data frames (framing-only) from ${resolvedEmail} — upstream returned 200 with no real content (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES}). First bytes: ${JSON.stringify(probeTextAccumulated.slice(0, 400))}`,
+          );
+          sawRealData = false; // demote to empty so the retry block below kicks in
+        }
+      }
     }
     if (!sawRealData) {
       // Non-SSE JSON body (e.g. {"success":false,data:{code:"RateLimited",...}})

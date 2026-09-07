@@ -107,9 +107,14 @@ export interface WreqFetchOptions {
 
 export async function wreqFetch(url: string, options: WreqFetchOptions = {}): Promise<Response> {
   const baseUrl = await ensureWorker();
-  const { method = 'GET', headers = {}, body, stream = false, impersonate = 'chrome_142', timeout = 30 } = options;
+  // Default timeout bumped from 30s → 60s for /files/parse endpoint which
+  // can take up to 30s+ on Qwen's side. The QWEN_FETCH_TIMEOUT_MS config
+  // in qwen.ts only applies to the AbortController on the bun→worker hop,
+  // NOT the worker→upstream hop. Pass an explicit per-request timeout so
+  // the worker uses a longer default for slow endpoints.
+  const { method = 'GET', headers = {}, body, stream = false, impersonate = 'chrome_142', timeout = 60 } = options;
 
-  logSessionCreate('wreqFetch.request', { method, url: url.split('?')[0], stream });
+  logSessionCreate('wreqFetch.request', { method, url: url.split('?')[0], stream, timeout });
 
   const makeReq = async (): Promise<Response> => {
     return fetch(`${baseUrl}/`, {

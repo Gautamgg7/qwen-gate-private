@@ -552,19 +552,27 @@ export async function pickAccount(excludeEmail?: string): Promise<AccountEntry |
       `[Account] Picked ${picked.email} — inFlight=${picked.inFlight} totalReqs=${picked.totalRequests} lastUsed=${picked.lastUsed ? Date.now() - picked.lastUsed + 'ms ago' : 'never'}${excludeEmail ? ` (excluded: ${excludeEmail})` : ''}`,
     );
     picked.lastUsed = Date.now();
-    // Reset stuck inFlight: if counter > 0 and last increment was > 60s ago, it leaked
-    if (picked.inFlight > 0 && picked.lastInFlightAt && Date.now() - picked.lastInFlightAt > 60_000) {
+    // Reset stuck inFlight: if counter > 0 and last increment was > 30s ago, it leaked
+    // (was 60s — too long: a hung stream ties up the account for 60s before reset).
+    // 30s is enough for any normal request to be in flight, short enough to recover
+    // quickly from leaked counters caused by browserlessFetch errors that don't
+    // go through the normal release path.
+    if (picked.inFlight > 0 && picked.lastInFlightAt && Date.now() - picked.lastInFlightAt > 30_000) {
       logStore.log(
         'warn',
         'auth',
         `[Account] Reset stuck inFlight for ${picked.email} (was ${picked.inFlight}, stuck for ${Math.round((Date.now() - picked.lastInFlightAt) / 1000)}s)`,
       );
       picked.inFlight = 0;
+      picked.lastInFlightAt = 0;
     }
     picked.inFlight++;
     picked.lastInFlightAt = Date.now();
-    // Safety valve: reset if counter drifts unreasonably high
-    if (picked.inFlight > 20) picked.inFlight = 0;
+    // Safety valve: reset if counter drifts unreasonably high (10, was 20)
+    if (picked.inFlight > 10) {
+      picked.inFlight = 1;
+      picked.lastInFlightAt = Date.now();
+    }
     return picked;
   } catch (err: any) {
     logStore.log('error', 'auth', 'pickAccount error:', err);
@@ -573,11 +581,17 @@ export async function pickAccount(excludeEmail?: string): Promise<AccountEntry |
 }
 export function incrementInFlight(email: string): void {
   const acct = getAccountByEmail(email);
-  if (acct) acct.inFlight++;
+  if (acct) {
+    acct.inFlight++;
+    acct.lastInFlightAt = Date.now();
+  }
 }
 export function decrementInFlight(email: string): void {
   const acct = getAccountByEmail(email);
-  if (acct && acct.inFlight > 0) acct.inFlight--;
+  if (acct && acct.inFlight > 0) {
+    acct.inFlight--;
+    if (acct.inFlight === 0) acct.lastInFlightAt = 0;
+  }
 }
 export function incrementTotalRequests(email: string): void {
   const acct = getAccountByEmail(email);

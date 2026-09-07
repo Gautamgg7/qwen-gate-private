@@ -214,6 +214,13 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
         logParsed: true,
       });
     }
+  } else if (delta.content !== undefined) {
+    // No phase field — OpenAI-compatible format. Treat as answer content.
+    // This matches the streaming path's extractDeltaContent() behavior.
+    processAnswerDelta(delta, state, ctx);
+  } else if (delta.reasoning_content !== undefined) {
+    // No phase field but has reasoning_content — treat as thinking.
+    processThinkingDelta({ phase: 'think', content: delta.reasoning_content }, state);
   }
 }
 
@@ -357,6 +364,35 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
     logStore.finalizeRequest(logId);
     const cleanMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
     return c.json({ error: { message: cleanMessage } }, upstreamError.status);
+  }
+
+  // ── Empty-result guard for non-streaming ─────────────────────────
+  // Same logic as the streaming path (streamLoop.ts): if Qwen returned
+  // HTTP 200 with no content, no reasoning, and no tool calls, surface a
+  // 502 "empty_response" error so the client retries — instead of sending
+  // a fake "successful" empty completion. This was the root cause of the
+  // empty `"content":""` responses seen in production logs.
+  const hasContent = (state.lastFullContent || '').trim().length > 0;
+  const hasReasoning = (state.reasoningBuffer || '').trim().length > 0;
+  const hasToolCalls = state.toolCallsOut.length > 0;
+  if (!hasContent && !hasReasoning && !hasToolCalls) {
+    logStore.log('warn', 'chat', `[NonStreaming] Empty result for ${logId}: no content/reasoning/tool_calls received from Qwen`);
+    logStore.addError(logId, 'Qwen returned an empty response (no content, reasoning, or tool calls)');
+    logStore.updateEntry(logId, (entry) => {
+      entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+      entry.finalResponse.finishReason = 'empty_response';
+    });
+    logStore.finalizeRequest(logId);
+    return c.json(
+      {
+        error: {
+          message: 'Qwen returned an empty response (no content, reasoning, or tool calls). Please retry.',
+          type: 'upstream_error',
+          code: 'empty_response',
+        },
+      },
+      502,
+    );
   }
 
   flushAndDetectLoops(state, logId);

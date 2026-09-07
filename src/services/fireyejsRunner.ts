@@ -72,6 +72,14 @@ export function resetBxUaCache(): void {
  * that matches what the real browser produces.
  */
 export async function generateBxPp(payload?: string): Promise<string | null> {
+  // Check if we have a real bx-pp template from the browser (extracted via
+  // refreshCookiesViaBrowser). Use it in preference to the hash fallback.
+  const browserBxPp = tokenCache.get('bx-pp-template');
+  if (browserBxPp) {
+    logStore.log('debug', 'fireyejs', `bx-pp using browser-extracted template (${browserBxPp.length} chars)`);
+    return browserBxPp;
+  }
+
   // ponytail: hash fallback until opcode 58 reverse-engineered
   try {
     const data = new TextEncoder().encode(payload || Date.now().toString());
@@ -118,6 +126,8 @@ const COOKIE_REFRESH_TTL_MS = 30 * 60 * 1000; // 30 min
 
 /**
  * Refresh cookies for an account by navigating chat.qwen.ai in a real browser.
+ * Also extracts real bx-ua and bx-pp tokens from the page's AWSC localStorage
+ * (the proper opcode-58 signature, not the hash fallback).
  *
  * @param cookieStr - Current saved cookies (may be stale)
  * @returns Fresh cookie string or null
@@ -145,6 +155,71 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
       const html = await page.evaluate(() => document.documentElement?.innerHTML || '').catch(() => '');
       if (!html.includes('aliyun_waf')) break;
       await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    // ── Extract real bx-ua and bx-pp tokens from AWSC ────────────────
+    // The AWSC fireyejs.js stores generated tokens in localStorage. These
+    // are the proper opcode-58 signatures that pass Qwen's WAF, not the
+    // SHA-256 hash fallback we generate in Node.js. Extract and cache them
+    // so subsequent browserless requests use the real tokens.
+    try {
+      const awscTokens = await page.evaluate(() => {
+        const result: { bxUa: string | null; bxPp: string | null } = { bxUa: null, bxPp: null };
+        try {
+          // AWSC stores tokens in localStorage with keys like "awsc_bxua", "bxua",
+          // "bx_ua", "fbx_ua" or similar. Try a few common keys.
+          for (const key of Object.keys(localStorage)) {
+            const lower = key.toLowerCase();
+            const value = localStorage.getItem(key) || '';
+            if (!result.bxUa && (lower.includes('bxua') || lower.includes('bx_ua') || lower === 'awsc_bxua')) {
+              if (value && value.length > 100) result.bxUa = value;
+            }
+            if (!result.bxPp && (lower.includes('bxpp') || lower.includes('bx_pp') || lower === 'awsc_bxpp')) {
+              if (value && value.length > 10) result.bxPp = value;
+            }
+          }
+          // Also try sessionStorage
+          for (const key of Object.keys(sessionStorage)) {
+            const lower = key.toLowerCase();
+            const value = sessionStorage.getItem(key) || '';
+            if (!result.bxUa && (lower.includes('bxua') || lower.includes('bx_ua'))) {
+              if (value && value.length > 100) result.bxUa = value;
+            }
+            if (!result.bxPp && (lower.includes('bxpp') || lower.includes('bx_pp'))) {
+              if (value && value.length > 10) result.bxPp = value;
+            }
+          }
+          // Also try to call AWSC directly — the fireyejs lib is often exposed
+          // as window.AWSC or window._AWSC.
+          const awsc: any = (window as any).AWSC || (window as any)._AWSC;
+          if (awsc && typeof awsc.getToken === 'function') {
+            try {
+              const token = awsc.getToken('bxua');
+              if (token && !result.bxUa) result.bxUa = token;
+            } catch {}
+            try {
+              const pp = awsc.getToken('bxpp');
+              if (pp && !result.bxPp) result.bxPp = pp;
+            } catch {}
+          }
+        } catch (e) {
+          // ignore — best effort
+        }
+        return result;
+      });
+
+      if (awscTokens?.bxUa) {
+        tokenCache.set('bx-ua', awscTokens.bxUa, BX_UA_TTL_MS);
+        logStore.log('info', 'fireyejs', `bx-ua extracted from browser AWSC (${awscTokens.bxUa.length} chars)`);
+      }
+      if (awscTokens?.bxPp) {
+        // bx-pp is per-request, so cache only briefly (60s)
+        tokenCache.set('bx-pp-template', awscTokens.bxPp, 60_000);
+        logStore.log('info', 'fireyejs', `bx-pp extracted from browser AWSC (${awscTokens.bxPp.length} chars)`);
+      }
+    } catch (err) {
+      // Best effort — don't fail the cookie refresh just because we couldn't extract tokens
+      logStore.log('debug', 'fireyejs', `bx-ua/bx-pp extraction from browser failed: ${(err as Error).message}`);
     }
 
     const freshCookies = await page.context().cookies();

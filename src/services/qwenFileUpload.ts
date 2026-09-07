@@ -190,22 +190,52 @@ async function parseFile(email: string, fileId: string): Promise<void> {
 
   const tokenInfo = await getTokenWithAccount(email);
   const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
-  const response = await browserlessFetch(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: 'application/json, text/plain, */*',
-      source: 'web',
-      cookie: cookieStr,
-      origin: QWEN_API_BASE,
-    },
-    body,
-    accountEmail: email,
-  });
-  if (!response.ok) {
-    const errText = await response.text().catch(() => '');
-    throw new Error(`parseFile failed: ${response.status} — ${errText.substring(0, 200)}`);
+
+  // Retry parse trigger up to 3 times — Qwen's /files/parse endpoint is flaky
+  // and sometimes times out (30s) on first call, then succeeds in <1s on retry.
+  // Use a longer per-attempt timeout (60s) so transient upstream slowness is tolerated.
+  const PARSE_MAX_RETRIES = 3;
+  const PARSE_ATTEMPT_TIMEOUT_MS = 60_000;
+  let lastErr: Error | null = null;
+  for (let attempt = 0; attempt < PARSE_MAX_RETRIES; attempt++) {
+    const attemptController = new AbortController();
+    const attemptTimer = setTimeout(() => attemptController.abort(new Error(`parseFile attempt ${attempt + 1} timed out`)), PARSE_ATTEMPT_TIMEOUT_MS);
+    try {
+      const response = await browserlessFetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/plain, */*',
+          source: 'web',
+          cookie: cookieStr,
+          origin: QWEN_API_BASE,
+        },
+        body,
+        accountEmail: email,
+        signal: attemptController.signal,
+      });
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`parseFile failed: ${response.status} — ${errText.substring(0, 200)}`);
+      }
+      // Success — drain body so the connection can be reused
+      await response.text().catch(() => {});
+      clearTimeout(attemptTimer);
+      return;
+    } catch (err: any) {
+      clearTimeout(attemptTimer);
+      lastErr = err instanceof Error ? err : new Error(String(err));
+      // If it was an AbortError (timeout) and we have retries left, retry
+      const isAbort = err?.name === 'AbortError' || /timeout|aborted/i.test(err?.message || '');
+      if (!isAbort || attempt === PARSE_MAX_RETRIES - 1) {
+        throw lastErr;
+      }
+      // Brief backoff before retry (500ms, 1s, 2s)
+      await Bun.sleep(500 * Math.pow(2, attempt));
+      logStore.log('warn', 'upload', `[FileUpload] parseFile retry ${attempt + 2}/${PARSE_MAX_RETRIES} for ${fileId} after: ${lastErr.message}`);
+    }
   }
+  if (lastErr) throw lastErr;
 }
 
 // --- Step 4: Poll parse status until complete ---
@@ -215,7 +245,7 @@ interface ParseStatusResponse {
   status: 'running' | 'success' | 'failed';
 }
 
-async function pollParseStatus(email: string, fileId: string, maxWaitMs = 5_000, fileSize = 0): Promise<void> {
+async function pollParseStatus(email: string, fileId: string, maxWaitMs = 10_000, fileSize = 0): Promise<void> {
   const url = `${QWEN_API_BASE}/api/v2/files/parse/status`;
   const startTime = Date.now();
   const pollInterval = 1_000;
@@ -223,7 +253,12 @@ async function pollParseStatus(email: string, fileId: string, maxWaitMs = 5_000,
   // Adaptive wait: large context files take longer to parse on Qwen's side.
   // A fixed 5s floor was too short for multi-hundred-KB files (the model was
   // called before parsing finished, which correlates with empty responses).
-  const adaptiveMs = Math.min(30_000, Math.max(maxWaitMs, Math.round((fileSize / 40_000) * 1000)));
+  // Bumped max from 30s → 90s and floor from 5s → 10s — large 100KB+ uploads
+  // routinely took 40-60s to flip to "success" under load.
+  const adaptiveMs = Math.min(90_000, Math.max(maxWaitMs, Math.round((fileSize / 20_000) * 1000)));
+
+  let lastStatus: string = '';
+  let successConfirmed = false;
 
   while (Date.now() - startTime < adaptiveMs) {
     const body = JSON.stringify({ file_id_list: [fileId] });
@@ -249,20 +284,31 @@ async function pollParseStatus(email: string, fileId: string, maxWaitMs = 5_000,
         const status: string = data.data?.[0]?.status || data.status || '';
         if (status === 'success') {
           logStore.log('debug', 'upload', `[FileUpload] Parse complete for ${fileId} in ${Date.now() - startTime}ms`);
+          successConfirmed = true;
           return;
         }
         if (status === 'failed') throw new Error(`File parsing failed for ${fileId}`);
-      } catch {
-        // JSON parse error or missing field — keep polling
+        lastStatus = status || lastStatus;
+      } catch (parseErr) {
+        // JSON parse error or missing field — keep polling unless the parse
+        // explicitly returned "failed" (handled above)
+        if (parseErr instanceof Error && /File parsing failed/.test(parseErr.message)) throw parseErr;
       }
     }
 
     await Bun.sleep(pollInterval);
   }
 
-  logStore.log('warn', 'upload', `[FileUpload] Parse poll timed out after ${Date.now() - startTime}ms for ${fileId} (was waiting up to ${adaptiveMs}ms)`);
   // ponytail: file upload succeeded, parse may still finish async.
   // Qwen will include the file content once parsing completes on its side.
+  // NOTE: We do NOT throw — the previous behavior of silently continuing is correct:
+  // the file IS uploaded, and Qwen's chat endpoint can sometimes pick it up after a
+  // short delay. We just log a warning.
+  logStore.log(
+    'warn',
+    'upload',
+    `[FileUpload] Parse poll timed out after ${Date.now() - startTime}ms for ${fileId} (status=${lastStatus || 'unknown'}, was waiting up to ${adaptiveMs}ms) — continuing, parse may finish async`,
+  );
 }
 
 // --- Shared internal: upload arbitrary file content ---
@@ -304,7 +350,7 @@ async function uploadFileContent(
     logStore.log('debug', 'upload', `[FileUpload] Parse triggered for ${sts.file_id}`);
 
     // Step 4: Poll until parsed (adaptive wait based on file size)
-    await pollParseStatus(email, sts.file_id, 5_000, fileSize);
+    await pollParseStatus(email, sts.file_id, 10_000, fileSize);
     logStore.log('debug', 'upload', `[FileUpload] Parse complete for ${sts.file_id}`);
   }
 
