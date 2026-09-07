@@ -113,7 +113,7 @@ else
   warn "Playwright browser install failed — continuing anyway"
 fi
 
-# ── Step 4c: Install browser_oxide (Rust stealth engine) + Go bridge ──
+# ── Step 4c: Install browser_oxide (Rust stealth engine + Python bindings) ──
 info "Installing browser_oxide (Rust stealth engine, optional but recommended)..."
 
 # Check for Rust
@@ -123,14 +123,20 @@ if ! command -v cargo &>/dev/null; then
   source "$HOME/.cargo/env"
 fi
 
-# Check for Go
-if ! command -v go &>/dev/null; then
-  info "Installing Go..."
-  GO_TAR="go1.23.4.linux-amd64.tar.gz"
-  mkdir -p "$HOME/go-install"
-  if curl -sSL "https://go.dev/dl/$GO_TAR" -o "/tmp/$GO_TAR" 2>/dev/null; then
-    tar -C "$HOME/go-install" -xzf "/tmp/$GO_TAR"
-    export PATH="$PATH:$HOME/go-install/go/bin"
+# Check for Python 3 (for browser_oxide Python bindings)
+if ! command -v python3 &>/dev/null; then
+  warn "Python 3 not found — browser_oxide Python bindings will be skipped"
+fi
+
+# Check for pip + maturin (for building Python bindings)
+if command -v python3 &>/dev/null; then
+  if ! python3 -m pip --version &>/dev/null 2>&1; then
+    info "Installing pip..."
+    python3 -m ensurepip --user >/dev/null 2>&1 || warn "pip install failed"
+  fi
+  if ! python3 -m maturin --version &>/dev/null 2>&1; then
+    info "Installing maturin (for building browser_oxide Python bindings)..."
+    python3 -m pip install --user maturin >/dev/null 2>&1 || warn "maturin install failed"
   fi
 fi
 
@@ -168,26 +174,16 @@ if command -v cargo &>/dev/null; then
   fi
   info "Building browser_oxide (this may take 10-20 minutes for first build)..."
   (cd "$BO_DIR" && cargo build --release -p browser_oxide 2>&1 | tail -5) || warn "browser_oxide build failed — using fallback"
-  if [ -f "$BO_DIR/target/release/browser_oxide" ]; then
-    cp "$BO_DIR/target/release/browser_oxide" "$HOME/.local/bin/browser_oxide"
-    ok "browser_oxide built and installed at $HOME/.local/bin/browser_oxide"
-  else
-    warn "browser_oxide binary not found — using Playwright fallback"
-  fi
-fi
 
-# Build qwen-gate-bridge (Go)
-if command -v go &>/dev/null; then
-  BRIDGE_DIR="$PROJECT_ROOT/../qwen-gate-bridge"
-  if [ -d "$BRIDGE_DIR" ]; then
-    info "Building qwen-gate-bridge (Go)..."
-    (cd "$BRIDGE_DIR" && go build -o qwen-gate-bridge . 2>&1 | tail -5) || warn "bridge build failed"
-    if [ -f "$BRIDGE_DIR/qwen-gate-bridge" ]; then
-      cp "$BRIDGE_DIR/qwen-gate-bridge" "$HOME/.local/bin/qwen-gate-bridge"
-      ok "qwen-gate-bridge built and installed at $HOME/.local/bin/qwen-gate-bridge"
+  # Build and install Python bindings via maturin
+  if [ -d "$BO_DIR/crates/browser_oxide_py" ] && command -v python3 &>/dev/null; then
+    info "Building browser_oxide Python bindings..."
+    (cd "$BO_DIR/crates/browser_oxide_py" && python3 -m maturin develop --release 2>&1 | tail -5) || warn "Python bindings build failed"
+    if python3 -c "from browser_oxide import Browser" 2>/dev/null; then
+      ok "browser_oxide Python bindings installed"
+    else
+      warn "browser_oxide Python bindings not importable"
     fi
-  else
-    warn "qwen-gate-bridge directory not found — skipping (will use Playwright fallback)"
   fi
 fi
 

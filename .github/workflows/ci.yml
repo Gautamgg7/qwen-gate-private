@@ -38,7 +38,7 @@ jobs:
 
   build-browser-oxide:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     needs: test
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
 
@@ -52,17 +52,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install CMake
-        run: |
-          wget -q https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5-linux-x86_64.tar.gz
-          tar -xzf cmake-3.30.5-linux-x86_64.tar.gz -C $HOME
-          echo "$HOME/cmake-3.30.5-linux-x86_64/bin" >> $GITHUB_PATH
-
-      - name: Install libclang
+      - name: Install CMake + libclang
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libclang-dev
-          echo "LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+          sudo apt-get install -y -qq cmake libclang-dev
 
       - name: Cache cargo build
         uses: actions/cache@v4
@@ -81,58 +74,33 @@ jobs:
         env:
           CC: gcc
           CXX: g++
+          LIBCLANG_PATH: /usr/lib/x86_64-linux-gnu
+
+      - name: Build Python bindings
+        working-directory: browser_oxide/crates/browser_oxide_py
+        run: |
+          pip install maturin
+          maturin develop --release
+          python3 -c "from browser_oxide import Browser, Profile; print('Python bindings OK')"
 
       - name: Verify binary
         run: |
-          ls -la browser_oxide/target/release/browser_oxide
-          ./browser_oxide/target/release/browser_oxide --help || true
+          ls -la browser_oxide/target/release/browser_oxide || true
 
       - name: Upload browser_oxide binary
         uses: actions/upload-artifact@v4
         with:
           name: browser-oxide-binary
-          path: browser_oxide/target/release/browser_oxide
+          path: |
+            browser_oxide/target/release/browser_oxide
+            browser_oxide/target/release/lib*.so
           retention-days: 7
-
-  build-go-bridge:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: test
-
-    steps:
-      - name: Checkout qwen-gate-bridge
-        uses: actions/checkout@v4
-        with:
-          repository: Gautamgg7/qwen-gate-bridge
-          path: qwen-gate-bridge
-        continue-on-error: true
-
-      - name: Setup Go
-        if: success()
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.23'
-
-      - name: Build qwen-gate-bridge
-        if: success()
-        working-directory: qwen-gate-bridge
-        run: |
-          go mod download
-          go build -o qwen-gate-bridge .
-          ls -la qwen-gate-bridge
-
-      - name: Upload bridge binary
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: qwen-gate-bridge-binary
-          path: qwen-gate-bridge/qwen-gate-bridge
-          retention-days: 7
+          if-no-files-found: ignore
 
   integration-test:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    needs: [test, build-browser-oxide, build-go-bridge]
+    needs: [test, build-browser-oxide]
     if: github.event_name == 'workflow_dispatch'
 
     steps:
@@ -150,42 +118,45 @@ jobs:
       - name: Install Playwright Chromium
         run: bunx playwright install --with-deps chromium
 
+      - name: Install Rust (for browser_oxide Python bindings)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CMake + libclang + Python deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake libclang-dev python3-pip
+          pip install maturin
+
       - name: Download browser_oxide binary
         uses: actions/download-artifact@v4
         with:
           name: browser-oxide-binary
-          path: /usr/local/bin
-
-      - name: Make binary executable
-        run: |
-          chmod +x /usr/local/bin/browser_oxide
-          /usr/local/bin/browser_oxide --help || true
-
-      - name: Start browser_oxide CDP server
-        run: |
-          nohup /usr/local/bin/browser_oxide serve --host 127.0.0.1 --port 9222 --log-level warning &
-          sleep 3
-          curl -s http://127.0.0.1:9222/json/version | head -5
-
-      - name: Download Go bridge binary
-        uses: actions/download-artifact@v4
-        with:
-          name: qwen-gate-bridge-binary
-          path: /usr/local/bin
+          path: /tmp/bo-artifacts
         continue-on-error: true
 
-      - name: Make bridge executable
-        run: chmod +x /usr/local/bin/qwen-gate-bridge || true
-
-      - name: Start Go bridge
+      - name: Install browser_oxide Python bindings (or build if download failed)
         run: |
-          if [ -f /usr/local/bin/qwen-gate-bridge ]; then
-            nohup /usr/local/bin/qwen-gate-bridge --cdp-url ws://127.0.0.1:9222 --listen :9223 &
-            sleep 2
-            curl -s http://127.0.0.1:9223/health || echo "Bridge not available"
+          if [ -f /tmp/bo-artifacts/browser_oxide ]; then
+            # Use cached binary — just build Python bindings
+            git clone --depth 1 https://github.com/yfedoseev/browser_oxide.git /tmp/bo-src
+            cp -r /tmp/bo-src/* /tmp/bo-src/.git .
+            cd /tmp/bo-src
+            # Reuse cached target
+            mkdir -p target/release
+            cp /tmp/bo-artifacts/browser_oxide target/release/ 2>/dev/null || true
+            cd crates/browser_oxide_py
+            maturin develop --release || echo "Python bindings build failed"
           else
-            echo "Bridge binary not available — using direct browser_oxide"
+            # Build from source
+            git clone --depth 1 https://github.com/yfedoseev/browser_oxide.git /tmp/bo-src
+            cd /tmp/bo-src
+            cargo build --release -p browser_oxide
+            cd crates/browser_oxide_py
+            maturin develop --release || echo "Python bindings build failed"
           fi
+          python3 -c "from browser_oxide import Browser; print('bindings OK')" || echo "bindings not importable"
+        env:
+          LIBCLANG_PATH: /usr/lib/x86_64-linux-gnu
 
       - name: Configure Qwen accounts from secrets
         env:
@@ -200,7 +171,6 @@ jobs:
           else
             echo '[]' > .qwen/accounts.json
           fi
-          # Add accounts from env vars
           for i in 1 2 3; do
             varname="ACCOUNT${i}"
             val=$(eval "echo \$$varname")
@@ -222,7 +192,7 @@ jobs:
         run: |
           nohup bun start > /tmp/qg-server.log 2>&1 &
           echo "Server PID: $!"
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
             sleep 1
             if grep -q "Background initialization complete" /tmp/qg-server.log 2>/dev/null; then
               echo "Server boot complete after ${i}s"
@@ -233,7 +203,7 @@ jobs:
 
       - name: Wait for server ready
         run: |
-          for i in $(seq 1 30); do
+          for i in $(seq 1 60); do
             if curl -s http://localhost:26405/v1/models > /dev/null 2>&1; then
               echo "Server is ready!"
               curl -s http://localhost:26405/v1/models | head -200

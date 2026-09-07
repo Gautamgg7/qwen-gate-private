@@ -10,12 +10,15 @@ RUN bun run build 2>/dev/null || true
 FROM debian:bookworm-slim AS production
 WORKDIR /app
 
-# Install system deps for Playwright/Chromium (fallback) + Lightpanda (preferred)
+# Install system deps for Playwright/Chromium (fallback) + Python (for browser_oxide bindings)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
     wget \
     unzip \
+    python3 \
+    python3-pip \
+    python3-venv \
     libnss3 \
     libnspr4 \
     libatk1.0-0 \
@@ -39,11 +42,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-freefont-ttf \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Lightpanda browser (lightweight, 170MB, used as preferred backend)
-RUN curl -L -o /usr/local/bin/lightpanda \
-      https://github.com/lightpanda-io/browser/releases/download/nightly/lightpanda-x86_64-linux \
-    && chmod a+x /usr/local/bin/lightpanda \
-    && /usr/local/bin/lightpanda version
+# Install Rust (for building browser_oxide)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Install CMake (for BoringSSL build)
+RUN curl -sSL https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5-linux-x86_64.tar.gz -o /tmp/cmake.tar.gz \
+    && tar -xzf /tmp/cmake.tar.gz -C /opt \
+    && ln -s /opt/cmake-3.30.5-linux-x86_64/bin/cmake /usr/local/bin/cmake \
+    && ln -s /opt/cmake-3.30.5-linux-x86_64/bin/ctest /usr/local/bin/ctest \
+    && rm /tmp/cmake.tar.gz
+
+# Install libclang (for bindgen)
+RUN apt-get update && apt-get install -y libclang-dev && rm -rf /var/lib/apt/lists/*
+ENV LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu
+
+# Install maturin (for building browser_oxide Python bindings)
+RUN pip3 install --break-system-packages maturin
+
+# Build browser_oxide (Rust) and Python bindings
+RUN git clone --depth 1 https://github.com/yfedoseev/browser_oxide.git /tmp/browser_oxide \
+    && cd /tmp/browser_oxide \
+    && cargo build --release -p browser_oxide \
+    && cp target/release/browser_oxide /usr/local/bin/ \
+    && cd crates/browser_oxide_py \
+    && maturin develop --release --break-system-packages \
+    && cd / \
+    && rm -rf /tmp/browser_oxide
 
 # Install Bun
 RUN curl -fsSL https://bun.sh/install | bash
@@ -58,7 +83,7 @@ COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/config.json ./config.json
 COPY --from=build /app/bin ./bin
 
-# Install Playwright Chromium (fallback for login/WAF)
+# Install Playwright Chromium (fallback for login + when browser_oxide is unavailable)
 RUN bunx playwright install --with-deps chromium 2>/dev/null || \
     npx playwright install --with-deps chromium 2>/dev/null || true
 
@@ -71,8 +96,6 @@ USER qwen
 
 ENV QWEN_GATE_PORT=26405
 ENV NODE_ENV=production
-ENV LIGHTPANDA_BINARY=/usr/local/bin/lightpanda
-ENV LIGHTPANDA_PORT=9222
 EXPOSE 26405
 VOLUME [ "/app/.qwen" ]
 
