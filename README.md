@@ -103,6 +103,65 @@ curl -X POST http://localhost:26405/v1/chat/completions \
   -d '{"model": "qwen3.5-flash", "stream": true, "messages": [{"role": "user", "content": "Count to 5"}]}'
 ```
 
+### How to Stop / Kill the Server
+
+If the server is already running and you need to stop it (e.g., port 26405 is in use, or you want to restart):
+
+#### Linux / macOS
+
+```bash
+# Option 1: If running in foreground, just press Ctrl+C in the terminal
+
+# Option 2: Kill by process name
+pkill -f "bun.*src/index"
+# or
+pkill -f "bun.*qwen"
+
+# Option 3: Kill whatever is on port 26405
+fuser -k 26405/tcp        # Linux
+lsof -ti:26405 | xargs kill -9   # macOS
+
+# Option 4: Find and kill manually
+ps aux | grep bun | grep -v grep
+kill -9 <PID>
+```
+
+#### Windows (PowerShell)
+
+```powershell
+# Option 1: If running in foreground, press Ctrl+C in the terminal
+
+# Option 2: Kill all Bun processes
+Get-Process bun -ErrorAction SilentlyContinue | Stop-Process -Force
+
+# Option 3: Kill whatever is on port 26405
+$pid = (Get-NetTCPConnection -LocalPort 26405 -ErrorAction SilentlyContinue).OwningProcess
+if ($pid) { Stop-Process -Id $pid -Force }
+
+# Option 4: Find and kill manually
+Get-Process | Where-Object { $_.ProcessName -like "*bun*" }
+Stop-Process -Name "bun" -Force
+```
+
+#### Verify the Server Stopped
+
+```bash
+# Linux / macOS
+curl -s http://localhost:26405/v1/models 2>&1 | head -5
+# Should say "Connection refused" if stopped
+
+# Or check the port
+lsof -i :26405    # macOS
+ss -tlnp | grep 26405   # Linux
+```
+
+After stopping, you can restart with:
+```bash
+bun start
+# or
+bash one-click-start.sh
+```
+
 ## Features
 
 - **Free Qwen Models** — Use Qwen 3.5-Flash, Qwen 3.7-Max, Qwen 3.7-Plus, Qwen 3.8-Max, and more for free in your existing tools. Point Claude Code, OpenCode, Qwen Code, Cursor, or any OpenAI-compatible client at Qwen Gate and use Qwen models without paying per-token.
