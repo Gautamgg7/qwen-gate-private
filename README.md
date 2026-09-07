@@ -16,6 +16,48 @@
 
 ## Quick Start
 
+### One-Click Setup (Linux / macOS)
+
+The fastest way to get started — downloads, installs, configures, and starts the server in one command:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/Gautamgg7/qwen-gate-private/main/one-click-start.sh | bash
+```
+
+Or clone and run:
+```bash
+git clone https://github.com/Gautamgg7/qwen-gate-private.git
+cd qwen-gate-private
+bash one-click-start.sh
+```
+
+This will:
+1. Install Bun (if not present)
+2. Install all dependencies (`bun install`)
+3. Install Playwright Chromium (for login + WAF fallback)
+4. Create `config.json` with optimal defaults
+5. Start the server on port 26405
+6. Open the dashboard in your browser
+
+### One-Click Setup (Windows)
+
+Open **PowerShell** (as administrator) and run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://raw.githubusercontent.com/Gautamgg7/qwen-gate-private/main/one-click-start.ps1 | iex"
+```
+
+Or clone and run:
+```powershell
+git clone https://github.com/Gautamgg7/qwen-gate-private.git
+cd qwen-gate-private
+powershell -ExecutionPolicy Bypass -File one-click-start.ps1
+```
+
+### Manual Setup
+
+If you prefer to do it step by step:
+
 ```bash
 git clone https://github.com/Gautamgg7/qwen-gate-private.git
 cd qwen-gate-private
@@ -23,7 +65,43 @@ bun install
 bun start
 ```
 
-Then open [http://localhost:26405/dashboard](http://localhost:26405/dashboard) to add accounts and start using the API.
+### After It Starts
+
+Once the server is running, you'll see:
+
+| URL | Purpose |
+|-----|---------|
+| http://localhost:26405/dashboard | Web dashboard (add accounts, view logs) |
+| http://localhost:26405/v1 | API base URL (for OpenCode, Cursor, Claude Code, etc.) |
+| http://localhost:26405/v1/models | List available Qwen models |
+
+> **Use `localhost`, not `127.0.0.1`** in client configs.
+
+### Add Your First Account
+
+1. Open [http://localhost:26405/dashboard/accounts](http://localhost:26405/dashboard/accounts)
+2. Enter your Qwen email and password
+3. Click **Add Account** — the gateway handles login and session persistence
+4. The account is now saved and will auto-login on restarts
+
+> **⚠️ Best practice:** Use **3+ accounts** for round-robin rotation to bypass cooldown limits. Do **not** use your personal Qwen account — create dedicated accounts.
+
+### Test the API
+
+```bash
+# List models
+curl http://localhost:26405/v1/models
+
+# Simple chat
+curl -X POST http://localhost:26405/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.5-flash", "messages": [{"role": "user", "content": "Hello!"}]}'
+
+# Streaming
+curl -X POST http://localhost:26405/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.5-flash", "stream": true, "messages": [{"role": "user", "content": "Count to 5"}]}'
+```
 
 ## Features
 
@@ -44,7 +122,10 @@ Then open [http://localhost:26405/dashboard](http://localhost:26405/dashboard) t
 - **No Build Step** — TypeScript executed directly via Bun. Run from source with no compilation needed.
 - **Bun-Powered** — Native TypeScript execution, built-in test runner, and cluster mode for multi-core utilization.
 
-## Installation
+## Installation (Detailed)
+
+> For the fastest setup, use the [One-Click Setup](#one-click-setup-linux--macos) above.
+> The instructions below are for manual/custom installation.
 
 ### Prerequisites
 
@@ -53,7 +134,9 @@ Then open [http://localhost:26405/dashboard](http://localhost:26405/dashboard) t
 - Rust/Cargo (for building browser_oxide, optional)
 - CMake + libclang (for BoringSSL build, only needed if building browser_oxide)
 
-### One-Command Install (Linux / macOS)
+### Full Install (with browser_oxide stealth engine)
+
+The `install.sh` script installs everything including Rust, Python, maturin, CMake, libclang, and builds browser_oxide from source:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/Gautamgg7/qwen-gate-private/main/install.sh | bash
@@ -95,17 +178,17 @@ After it starts:
 - **API base URL** (for OpenCode, Cursor, Claude Code, etc.): `http://localhost:26405/v1` — no API key needed unless you set `API_KEY` in `config.json`
 - **List available models**: `curl http://localhost:26405/v1/models`
 
-> **Use `localhost`, not `127.0.0.1`** in client configs — Bun binds the OS-resolved `localhost` (IPv6 on some machines), so `127.0.0.1` may refuse to connect. `http://localhost:26405/v1` always works.
-
 > **Accounts are persistent** — they live in `.qwen/accounts.json` (with browser sessions in `.qwen/browser-profiles/`), so after any restart all accounts log back in automatically. Add accounts once via the dashboard and they survive reboots.
 
 ### Add Accounts
 
 > **⚠️ Best practice:** Use **3+ accounts** for round-robin rotation to bypass cooldown limits. Do **not** use your personal Qwen account — create dedicated accounts.
 
-1. Open [http://localhost:26405/dashboard/accounts](http://localhost:26405/dashboard/accounts)
-2. Enter your Qwen email and password
-3. Click **Add Account** — the gateway handles login and session persistence
+Accounts are managed via the dashboard at [http://localhost:26405/dashboard/accounts](http://localhost:26405/dashboard/accounts):
+
+1. Enter your Qwen email and password
+2. Click **Add Account** — the gateway handles login and session persistence
+3. Accounts are saved in `.qwen/accounts.json` and auto-login on restarts
 
 ## Usage
 
