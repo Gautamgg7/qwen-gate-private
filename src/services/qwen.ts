@@ -185,11 +185,12 @@ async function applyRequestJitter(accountEmail?: string): Promise<void> {
 }
 
 const qwenCircuitBreaker = new CircuitBreaker('qwen-api', {
-  // In CDP mode, first requests per context can take longer (baxia warmup).
-  // With 8 accounts, we need a higher threshold to avoid premature circuit open.
-  failureThreshold: 5,
-  resetTimeoutMs: 30_000,
-  halfOpenMaxAttempts: 1,
+  // Configurable via env vars. In CI/agent mode, set CIRCUIT_BREAKER_FAILURE_THRESHOLD=999
+  // to effectively disable the circuit breaker (WAF blocks repeatedly but we want to
+  // keep trying with backoff rather than give up).
+  failureThreshold: parseInt(process.env.CIRCUIT_BREAKER_FAILURE_THRESHOLD || '5', 10),
+  resetTimeoutMs: parseInt(process.env.CIRCUIT_BREAKER_RESET_TIMEOUT_MS || '30000', 10),
+  halfOpenMaxAttempts: parseInt(process.env.CIRCUIT_BREAKER_HALF_OPEN_MAX || '1', 10),
 });
 
 export async function createQwenStream(
