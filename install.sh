@@ -113,6 +113,84 @@ else
   warn "Playwright browser install failed — continuing anyway"
 fi
 
+# ── Step 4c: Install browser_oxide (Rust stealth engine) + Go bridge ──
+info "Installing browser_oxide (Rust stealth engine, optional but recommended)..."
+
+# Check for Rust
+if ! command -v cargo &>/dev/null; then
+  info "Installing Rust toolchain..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null 2>&1
+  source "$HOME/.cargo/env"
+fi
+
+# Check for Go
+if ! command -v go &>/dev/null; then
+  info "Installing Go..."
+  GO_TAR="go1.23.4.linux-amd64.tar.gz"
+  mkdir -p "$HOME/go-install"
+  if curl -sSL "https://go.dev/dl/$GO_TAR" -o "/tmp/$GO_TAR" 2>/dev/null; then
+    tar -C "$HOME/go-install" -xzf "/tmp/$GO_TAR"
+    export PATH="$PATH:$HOME/go-install/go/bin"
+  fi
+fi
+
+# Check for cmake (needed by BoringSSL build)
+if ! command -v cmake &>/dev/null; then
+  info "Installing CMake..."
+  mkdir -p "$HOME/cmake-install"
+  if curl -sSL "https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5-linux-x86_64.tar.gz" -o /tmp/cmake.tar.gz 2>/dev/null; then
+    tar -C "$HOME/cmake-install" -xzf /tmp/cmake.tar.gz
+    export PATH="$PATH:$HOME/cmake-install/cmake-3.30.5-linux-x86_64/bin"
+  fi
+fi
+
+# Install libclang (needed by bindgen for BoringSSL)
+if [ ! -f "$HOME/llvm-install/lib/libclang.so" ]; then
+  info "Installing libclang..."
+  mkdir -p "$HOME/llvm-install/lib"
+  if curl -sSL "https://github.com/llvm/llvm-project/releases/download/llvmorg-17.0.6/clang+llvm-17.0.6-x86_64-linux-gnu-ubuntu-22.04.tar.xz" -o /tmp/llvm.tar.xz 2>/dev/null; then
+    tar -xJf /tmp/llvm.tar.xz -C "$HOME/llvm-install" --strip-components=1 \
+      --wildcards '*/lib/libclang.so*' \
+      --wildcards '*/lib/libclang-cpp.so*' 2>/dev/null
+    rm -f /tmp/llvm.tar.xz
+  fi
+fi
+
+export LIBCLANG_PATH="$HOME/llvm-install/lib"
+export LD_LIBRARY_PATH="$LIBCLANG_PATH:$LD_LIBRARY_PATH"
+
+# Build browser_oxide (Rust) — clones the repo and runs cargo build
+if command -v cargo &>/dev/null; then
+  BO_DIR="$HOME/qwen-gate-browser-oxide"
+  if [ ! -d "$BO_DIR" ]; then
+    info "Cloning browser_oxide..."
+    git clone --depth 1 https://github.com/yfedoseev/browser_oxide.git "$BO_DIR" 2>/dev/null
+  fi
+  info "Building browser_oxide (this may take 10-20 minutes for first build)..."
+  (cd "$BO_DIR" && cargo build --release -p browser_oxide 2>&1 | tail -5) || warn "browser_oxide build failed — using fallback"
+  if [ -f "$BO_DIR/target/release/browser_oxide" ]; then
+    cp "$BO_DIR/target/release/browser_oxide" "$HOME/.local/bin/browser_oxide"
+    ok "browser_oxide built and installed at $HOME/.local/bin/browser_oxide"
+  else
+    warn "browser_oxide binary not found — using Playwright fallback"
+  fi
+fi
+
+# Build qwen-gate-bridge (Go)
+if command -v go &>/dev/null; then
+  BRIDGE_DIR="$PROJECT_ROOT/../qwen-gate-bridge"
+  if [ -d "$BRIDGE_DIR" ]; then
+    info "Building qwen-gate-bridge (Go)..."
+    (cd "$BRIDGE_DIR" && go build -o qwen-gate-bridge . 2>&1 | tail -5) || warn "bridge build failed"
+    if [ -f "$BRIDGE_DIR/qwen-gate-bridge" ]; then
+      cp "$BRIDGE_DIR/qwen-gate-bridge" "$HOME/.local/bin/qwen-gate-bridge"
+      ok "qwen-gate-bridge built and installed at $HOME/.local/bin/qwen-gate-bridge"
+    fi
+  else
+    warn "qwen-gate-bridge directory not found — skipping (will use Playwright fallback)"
+  fi
+fi
+
 # ── Step 5: Create config.json ───────────────────────────────────────
 if [ ! -f config.json ]; then
   info "config.json will be auto-generated on first start"

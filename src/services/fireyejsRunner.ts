@@ -96,30 +96,123 @@ export async function generateBxPp(payload?: string): Promise<string | null> {
 }
 
 // ─── Cookie refresh via browser ─────────────────────────────────────────────
+//
+// Three backends supported (browser_oxide bridge preferred, then Lightpanda,
+// then cloakbrowser):
+//
+// 1. browser_oxide bridge — Rust stealth engine via Go bridge.
+//    Native BoringSSL TLS, V8 JS, ~15x lighter than Chrome. Best for stealth.
+//    Requires: qwen-gate-bridge Go binary running on port 9223, which proxies
+//    to browser_oxide Rust binary on port 9222.
+//
+// 2. Lightpanda — lightweight Zig-based headless browser (170MB binary,
+//    ~123MB memory, ~9x faster than Chromium). Connects via CDP.
+//    Good for cookie refresh and basic page navigation.
+//
+// 3. cloakbrowser — stealth Chromium (2GB download, ~2GB memory).
+//    Required for login (because Lightpanda lacks stealth fingerprinting).
+//    Fallback when browser_oxide bridge and Lightpanda fail.
 
 let playwrightBrowser: any = null;
+let lastCookieRefreshAt = 0;
+let lastCookieRefreshBackend: 'browser_oxide' | 'lightpanda' | 'cloakbrowser' | null = null;
 
 async function getBrowser(): Promise<any> {
   if (playwrightBrowser && !(playwrightBrowser as any)._closed) {
     return playwrightBrowser;
   }
+  // Try browser_oxide bridge first (fastest, stealthy)
+  try {
+    const { isBridgeAvailable, bridgeNavigate } = await import('./browserOxideBridge.ts');
+    if (await isBridgeAvailable()) {
+      logStore.log('debug', 'fireyejs', 'Using browser_oxide bridge backend for cookie refresh');
+      // Return a proxy object that implements the navigate/cookies API
+      // via the bridge's REST endpoints.
+      lastCookieRefreshBackend = 'browser_oxide';
+      return createBridgeProxyBrowser();
+    }
+  } catch (err: any) {
+    logStore.log('debug', 'fireyejs', `browser_oxide bridge unavailable: ${err.message}`);
+  }
+  // Try Lightpanda next (much faster, less memory)
+  try {
+    const { getLightpandaBrowser } = await import('./lightpandaBrowser.ts');
+    playwrightBrowser = await getLightpandaBrowser();
+    logStore.log('debug', 'fireyejs', 'Using Lightpanda backend for cookie refresh');
+    lastCookieRefreshBackend = 'lightpanda';
+    return playwrightBrowser;
+  } catch (err: any) {
+    logStore.log('warn', 'fireyejs', `Lightpanda backend unavailable: ${err.message} — falling back to Chromium`);
+  }
+  // Fallback to standard Chromium
   const { chromium } = await import('playwright');
   playwrightBrowser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
+  lastCookieRefreshBackend = 'cloakbrowser';
   return playwrightBrowser;
 }
 
+/**
+ * Create a proxy "browser" object that implements the subset of the Playwright
+ * Browser API used by refreshCookiesViaBrowser (newPage, cookies, close) but
+ * routes the actual work through the browser_oxide bridge.
+ */
+function createBridgeProxyBrowser(): any {
+  return {
+    _closed: false,
+    async newPage(): Promise<any> {
+      return createBridgeProxyPage();
+    },
+    async close(): Promise<void> {
+      this._closed = true;
+    },
+  };
+}
+
+/**
+ * Create a proxy Page that routes through the browser_oxide bridge.
+ */
+function createBridgeProxyPage(): any {
+  let currentUrl = '';
+  return {
+    async goto(url: string, opts?: any): Promise<void> {
+      currentUrl = url;
+      try {
+        const { bridgeNavigate } = await import('./browserOxideBridge.ts');
+        await bridgeNavigate(url);
+      } catch (err: any) {
+        logStore.log('debug', 'fireyejs', `[bridge] navigate to ${url} failed: ${err.message}`);
+      }
+    },
+    async evaluate(fn: any): Promise<any> {
+      // For browser_oxide bridge, we don't have a full evaluate API yet.
+      // Return empty HTML (cookie refresh doesn't need it)
+      return '';
+    },
+    async waitForTimeout(ms: number): Promise<void> {
+      await new Promise((r) => setTimeout(r, ms));
+    },
+    async close(): Promise<void> {
+      // no-op
+    },
+    _lightpandaContext: null,
+    _isBridgeProxy: true,
+  };
+}
+
 async function closeBrowser(): Promise<void> {
-  if (playwrightBrowser && !(playwrightBrowser as any)._closed) {
+  // Don't close the shared Lightpanda or browser_oxide bridge browser —
+  // they're managed by their own modules. Only close standalone Chromium.
+  if (playwrightBrowser && lastCookieRefreshBackend === 'cloakbrowser') {
     try {
       await playwrightBrowser.close();
     } catch {
       // already closed
     }
-    playwrightBrowser = null;
   }
+  playwrightBrowser = null;
 }
 
 const COOKIE_REFRESH_TTL_MS = 30 * 60 * 1000; // 30 min
@@ -137,6 +230,25 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
   try {
     const browser = await getBrowser();
     page = await browser.newPage();
+
+    // For browser_oxide bridge proxy: there's no context().cookies() —
+    // the bridge doesn't track per-context cookies yet. Return the input
+    // cookie string (preserving whatever we already had) and rely on the
+    // bx-ua/bx-pp extraction or the bridge's stealth fetch.
+    if (page._isBridgeProxy) {
+      logStore.log('debug', 'fireyejs', 'Using browser_oxide bridge for cookie refresh — preserving existing cookies');
+      // Navigate to chat.qwen.ai to refresh acw_tc and baxia cookies via stealth TLS
+      await page.goto(QWEN_API_BASE).catch(() => {});
+      // Brief wait for any cookies to set
+      await new Promise((r) => setTimeout(r, 2000));
+      // The bridge keeps its own cookie jar; we return the existing cookieStr
+      // (the stealth fetch path will use it via the bridge's chat-fetch endpoint).
+      if (cookieStr) {
+        logStore.log('info', 'fireyejs', `Cookies preserved via bridge: ${cookieStr.substring(0, 60)}...`);
+        return cookieStr;
+      }
+      return null;
+    }
 
     if (cookieStr) {
       const cookies = cookieStr.split(';').map((pair: string) => {

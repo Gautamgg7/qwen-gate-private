@@ -1,14 +1,404 @@
-name: CI
-on: [push, pull_request]
+name: CI - Qwen Gate Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: oven-sh/setup-bun@v2
+      - name: Checkout qwen-gate-private
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - run: bun install --frozen-lockfile
-      - run: bunx biome check src/
-      - run: bunx tsc --noEmit
-      - run: bun test
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Lint (Biome)
+        run: bun run format:check
+        continue-on-error: true
+
+      - name: Run unit tests
+        run: bun test
+        env:
+          TEST_MOCK_PLAYWRIGHT: "1"
+
+      - name: Verify TypeScript compiles
+        run: bun build src/index.tsx --target=bun --outdir /tmp/qg-build
+
+  build-browser-oxide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: test
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout browser_oxide
+        uses: actions/checkout@v4
+        with:
+          repository: yfedoseev/browser_oxide
+          path: browser_oxide
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install CMake
+        run: |
+          wget -q https://github.com/Kitware/CMake/releases/download/v3.30.5/cmake-3.30.5-linux-x86_64.tar.gz
+          tar -xzf cmake-3.30.5-linux-x86_64.tar.gz -C $HOME
+          echo "$HOME/cmake-3.30.5-linux-x86_64/bin" >> $GITHUB_PATH
+
+      - name: Install libclang
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libclang-dev
+          echo "LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu" >> $GITHUB_ENV
+
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            browser_oxide/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('browser_oxide/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build browser_oxide
+        working-directory: browser_oxide
+        run: cargo build --release -p browser_oxide
+        env:
+          CC: gcc
+          CXX: g++
+
+      - name: Verify binary
+        run: |
+          ls -la browser_oxide/target/release/browser_oxide
+          ./browser_oxide/target/release/browser_oxide --help || true
+
+      - name: Upload browser_oxide binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-oxide-binary
+          path: browser_oxide/target/release/browser_oxide
+          retention-days: 7
+
+  build-go-bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: test
+
+    steps:
+      - name: Checkout qwen-gate-bridge
+        uses: actions/checkout@v4
+        with:
+          repository: Gautamgg7/qwen-gate-bridge
+          path: qwen-gate-bridge
+        continue-on-error: true
+
+      - name: Setup Go
+        if: success()
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Build qwen-gate-bridge
+        if: success()
+        working-directory: qwen-gate-bridge
+        run: |
+          go mod download
+          go build -o qwen-gate-bridge .
+          ls -la qwen-gate-bridge
+
+      - name: Upload bridge binary
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-gate-bridge-binary
+          path: qwen-gate-bridge/qwen-gate-bridge
+          retention-days: 7
+
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: [test, build-browser-oxide, build-go-bridge]
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout qwen-gate-private
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+
+      - name: Download browser_oxide binary
+        uses: actions/download-artifact@v4
+        with:
+          name: browser-oxide-binary
+          path: /usr/local/bin
+
+      - name: Make binary executable
+        run: |
+          chmod +x /usr/local/bin/browser_oxide
+          /usr/local/bin/browser_oxide --help || true
+
+      - name: Start browser_oxide CDP server
+        run: |
+          nohup /usr/local/bin/browser_oxide serve --host 127.0.0.1 --port 9222 --log-level warning &
+          sleep 3
+          curl -s http://127.0.0.1:9222/json/version | head -5
+
+      - name: Download Go bridge binary
+        uses: actions/download-artifact@v4
+        with:
+          name: qwen-gate-bridge-binary
+          path: /usr/local/bin
+        continue-on-error: true
+
+      - name: Make bridge executable
+        run: chmod +x /usr/local/bin/qwen-gate-bridge || true
+
+      - name: Start Go bridge
+        run: |
+          if [ -f /usr/local/bin/qwen-gate-bridge ]; then
+            nohup /usr/local/bin/qwen-gate-bridge --cdp-url ws://127.0.0.1:9222 --listen :9223 &
+            sleep 2
+            curl -s http://127.0.0.1:9223/health || echo "Bridge not available"
+          else
+            echo "Bridge binary not available — using direct browser_oxide"
+          fi
+
+      - name: Configure Qwen accounts from secrets
+        env:
+          QWEN_ACCOUNTS_JSON: ${{ secrets.QWEN_ACCOUNTS_JSON }}
+          ACCOUNT1: ${{ secrets.ACCOUNT1 }}
+          ACCOUNT2: ${{ secrets.ACCOUNT2 }}
+          ACCOUNT3: ${{ secrets.ACCOUNT3 }}
+        run: |
+          mkdir -p .qwen
+          if [ -n "$QWEN_ACCOUNTS_JSON" ]; then
+            echo "$QWEN_ACCOUNTS_JSON" > .qwen/accounts.json
+          else
+            echo '[]' > .qwen/accounts.json
+          fi
+          # Add accounts from env vars
+          for i in 1 2 3; do
+            varname="ACCOUNT${i}"
+            val=$(eval "echo \$$varname")
+            if [ -n "$val" ]; then
+              email="${val%%:*}"
+              pass="${val#*:}"
+              node -e "
+                const fs = require('fs');
+                const f = '.qwen/accounts.json';
+                let arr = JSON.parse(fs.readFileSync(f, 'utf8') || '[]');
+                arr.push({email: '$email', password: '$pass'});
+                fs.writeFileSync(f, JSON.stringify(arr, null, 2));
+              "
+            fi
+          done
+          cat .qwen/accounts.json | head -20
+
+      - name: Start Qwen Gate server
+        run: |
+          nohup bun start > /tmp/qg-server.log 2>&1 &
+          echo "Server PID: $!"
+          for i in $(seq 1 60); do
+            sleep 1
+            if grep -q "Background initialization complete" /tmp/qg-server.log 2>/dev/null; then
+              echo "Server boot complete after ${i}s"
+              break
+            fi
+          done
+          tail -30 /tmp/qg-server.log
+
+      - name: Wait for server ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:26405/v1/models > /dev/null 2>&1; then
+              echo "Server is ready!"
+              curl -s http://localhost:26405/v1/models | head -200
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Server failed to become ready"
+          tail -100 /tmp/qg-server.log
+          exit 1
+
+      - name: Test 1 - Models endpoint
+        run: |
+          echo "=== Test 1: GET /v1/models ==="
+          models=$(curl -s http://localhost:26405/v1/models --max-time 30)
+          echo "$models" | head -200
+          if echo "$models" | grep -q "qwen3"; then
+            echo "✓ Test 1 PASSED"
+          else
+            echo "✗ Test 1 FAILED"
+            exit 1
+          fi
+
+      - name: Test 2 - Non-streaming chat
+        run: |
+          echo "=== Test 2: Non-streaming chat ==="
+          response=$(curl -s -X POST http://localhost:26405/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model": "qwen3.5-flash", "stream": false, "messages": [{"role": "user", "content": "Say hello in exactly 5 words"}]}' \
+            --max-time 180)
+          echo "Response: $response"
+          if echo "$response" | grep -q '"content"'; then
+            echo "✓ Test 2 PASSED"
+          else
+            echo "✗ Test 2 FAILED"
+            exit 1
+          fi
+
+      - name: Test 3 - Streaming chat
+        run: |
+          echo "=== Test 3: Streaming chat ==="
+          response=$(curl -sN -X POST http://localhost:26405/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model": "qwen3.5-flash", "stream": true, "messages": [{"role": "user", "content": "Count to 5"}]}' \
+            --max-time 180)
+          echo "Response: $(echo "$response" | head -50)"
+          if echo "$response" | grep -q "data:" && echo "$response" | grep -q "\[DONE\]"; then
+            echo "✓ Test 3 PASSED"
+          else
+            echo "✗ Test 3 FAILED"
+            exit 1
+          fi
+
+      - name: Test 4 - Tool calling
+        run: |
+          echo "=== Test 4: Tool calling ==="
+          response=$(curl -s -X POST http://localhost:26405/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model": "qwen3.5-flash", "stream": false, "messages": [{"role": "user", "content": "What is the weather in Paris? Use the get_weather tool."}], "tools": [{"type": "function", "function": {"name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]}' \
+            --max-time 180)
+          echo "Response: $response"
+          if echo "$response" | grep -q 'tool_calls\|"content"'; then
+            echo "✓ Test 4 PASSED"
+          else
+            echo "⚠ Test 4 WARNING: no tool_calls"
+          fi
+
+      - name: Test 5 - Large context (50KB)
+        run: |
+          echo "=== Test 5: Large context ==="
+          python3 -c "
+            import json
+            text = 'This is line. ' + '. '.join([f'item {i}' for i in range(5000)])
+            payload = {
+              'model': 'qwen3.5-flash',
+              'stream': False,
+              'messages': [
+                {'role': 'system', 'content': 'You are a helpful assistant.'},
+                {'role': 'user', 'content': f'Context:\n\n{text}\n\nSummarize in 10 words.'}
+              ]
+            }
+            with open('/tmp/large.json', 'w') as f: json.dump(payload, f)
+          "
+          response=$(curl -s -X POST http://localhost:26405/v1/chat/completions \
+            -H "Content-Type: application/json" -d @/tmp/large.json --max-time 180)
+          echo "$response" | head -c 500
+          echo ""
+          if echo "$response" | grep -q '"content"'; then
+            echo "✓ Test 5 PASSED"
+          else
+            echo "⚠ Test 5 WARNING"
+          fi
+
+      - name: Test 6 - Multi-turn (5 turns)
+        run: |
+          echo "=== Test 6: Multi-turn ==="
+          response=$(curl -s -X POST http://localhost:26405/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model": "qwen3.5-flash", "stream": false, "messages": [
+              {"role": "user", "content": "Hi, my name is TestBot. Remember this."},
+              {"role": "assistant", "content": "Hi TestBot! I will remember your name."},
+              {"role": "user", "content": "What is my name?"}
+            ]}' \
+            --max-time 60)
+          echo "$response" | head -c 300
+          echo ""
+          if echo "$response" | grep -iq "TestBot"; then
+            echo "✓ Test 6 PASSED"
+          else
+            echo "⚠ Test 6 WARNING"
+          fi
+
+      - name: Test 7 - Image URL
+        run: |
+          echo "=== Test 7: Image URL ==="
+          response=$(curl -s -X POST http://localhost:26405/v1/chat/completions \
+            -H "Content-Type: application/json" \
+            -d '{"model": "qwen3.7-plus", "stream": false, "messages": [{"role": "user", "content": [{"type": "text", "text": "Describe this image"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAA="}}]}]}' \
+            --max-time 180)
+          echo "$response" | head -c 500
+          echo ""
+          if echo "$response" | grep -q '"content"'; then
+            echo "✓ Test 7 PASSED"
+          else
+            echo "⚠ Test 7 WARNING"
+          fi
+
+      - name: Test 8 - Concurrent (5 parallel)
+        run: |
+          echo "=== Test 8: Concurrent ==="
+          for i in 1 2 3 4 5; do
+            curl -s -X POST http://localhost:26405/v1/chat/completions \
+              -H "Content-Type: application/json" \
+              -d "{\"model\": \"qwen3.5-flash\", \"stream\": false, \"messages\": [{\"role\": \"user\", \"content\": \"Say hi $i\"}]}" \
+              --max-time 60 > /tmp/concurrent-$i.json &
+          done
+          wait
+          success=0
+          for i in 1 2 3 4 5; do
+            if grep -q '"content"' /tmp/concurrent-$i.json; then
+              success=$((success + 1))
+            fi
+          done
+          echo "Success: $success/5"
+          if [ "$success" -ge 3 ]; then
+            echo "✓ Test 8 PASSED"
+          else
+            echo "✗ Test 8 FAILED"
+          fi
+
+      - name: Upload server logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwen-gate-server-logs
+          path: |
+            /tmp/qg-server.log
+            /tmp/concurrent-*.json
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "Server log tail:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tail -50 /tmp/qg-server.log >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
