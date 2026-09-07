@@ -6,9 +6,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bun](https://img.shields.io/badge/Bun-1.3+-pink.svg)](https://bun.sh/)
-[![GitHub Release](https://img.shields.io/github/v/release/youssefvdel/qwen-gate)](https://github.com/youssefvdel/qwen-gate/releases)
 [![TypeScript](https://img.shields.io/badge/TypeScript-6.0-blue)](https://www.typescriptlang.org/)
-[![Browserless](https://img.shields.io/badge/Stack-Browserless-8B5CF6)](https://bun.sh)
+[![Rust](https://img.shields.io/badge/Rust-browser__oxide-orange.svg)](https://github.com/yfedoseev/browser_oxide)
+[![Tests](https://img.shields.io/badge/Tests-154%2F154-brightgreen.svg)]()
 
 > **Disclaimer**: This project is for educational and study purposes. It provides access to Qwen models via `chat.qwen.ai` browser automation. Not affiliated with Alibaba Group or Qwen. Users must comply with `chat.qwen.ai`'s terms of service.
 
@@ -17,61 +17,55 @@
 ## Quick Start
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/youssefvdel/qwen-gate/main/install.sh | bash
-cd qwen-gate
-qg
+git clone https://github.com/Gautamgg7/qwen-gate-private.git
+cd qwen-gate-private
+bun install
+bun start
 ```
 
 Then open [http://localhost:26405/dashboard](http://localhost:26405/dashboard) to add accounts and start using the API.
 
 ## Features
 
-- **Free Qwen Models** — Use Qwen 3.7-Max, Qwen 3-Max, Qwen 3-Plus, and more for free in your existing tools. Point Claude Code, OpenCode, Qwen Code, Cursor, or any OpenAI-compatible client at Qwen Gate and use Qwen models without paying per-token.
+- **Free Qwen Models** — Use Qwen 3.5-Flash, Qwen 3.7-Max, Qwen 3.7-Plus, Qwen 3.8-Max, and more for free in your existing tools. Point Claude Code, OpenCode, Qwen Code, Cursor, or any OpenAI-compatible client at Qwen Gate and use Qwen models without paying per-token.
 - **OpenAI-Compatible API** — Drop-in replacement for `/v1/chat/completions` and `/v1/models`. Works with existing OpenAI SDKs, curl, or any HTTP client.
+- **Anthropic-Compatible API** — Also supports `/v1/messages` endpoint for Claude Code and other Anthropic-compatible clients.
 - **Multi-Account Rotation** — Configure multiple Qwen accounts (3+ recommended). Requests are distributed via round-robin with automatic failover and cooldown tracking — cooldown limits become a non-issue.
 - **Session Pooling** — Browser sessions are pooled, reused, and autoscaled under load. No per-request login overhead.
 - **Tool Calling** — Full OpenAI-style function calling with JSON Schema validation and spam guards.
 - **Streaming SSE** — Server-Sent Events with heartbeat keep-alive and content filter integrity maintained across stream boundaries.
 - **Content Filter Pipeline** — Strips thinking tags and filters internal artifacts from model output.
 - **Web Dashboard** — Real-time monitoring with 5 pages: overview, request log, account manager, network debug, and settings.
-- **Dual Transport** — Pure Node.js fetch via wreq-js for requests, Playwright browser automation for login/auth only. No browser needed for API calls.
+- **WAF Detection & Bypass** — Detects Qwen's baxia anti-bot WAF (`FAIL_SYS_USER_VALIDATE` / `RGV587_ERROR`) and retries with fresh tokens + browser cookie refresh.
+- **Browser Stealth Fallback** — Uses [browser_oxide](https://github.com/yfedoseev/browser_oxide) (Rust stealth engine via Python bindings) as primary browser backend, with cloakbrowser (stealth Chromium) as fallback for WAF-bypassed chat completions.
 - **File Upload** — Large context payloads auto-uploaded as Qwen file attachments. Context above limit goes to `context.txt`, latest user message stays inline for low latency.
+- **Image Support** — Supports image_url content blocks for vision models (qwen3.7-plus, qwen3.8-max, etc.).
+- **Configurable Circuit Breaker** — Configurable via env vars (`CIRCUIT_BREAKER_FAILURE_THRESHOLD`, `CIRCUIT_BREAKER_RESET_TIMEOUT_MS`) to disable for agent/CI mode.
 - **No Build Step** — TypeScript executed directly via Bun. Run from source with no compilation needed.
 - **Bun-Powered** — Native TypeScript execution, built-in test runner, and cluster mode for multi-core utilization.
 
 ## Installation
 
+### Prerequisites
+
+- [Bun](https://bun.sh/) 1.3+ (TypeScript runtime)
+- Python 3 (for browser_oxide bindings, optional but recommended)
+- Rust/Cargo (for building browser_oxide, optional)
+- CMake + libclang (for BoringSSL build, only needed if building browser_oxide)
+
 ### One-Command Install (Linux / macOS)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/youssefvdel/qwen-gate/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/Gautamgg7/qwen-gate-private/main/install.sh | bash
 ```
 
-This clones the repo, installs dependencies, creates `config.json`, and symlinks the `qg` / `qwengate` / `qwen-gate` CLI commands.
-
-### Windows Install
-
-Open **PowerShell** (as administrator) and run:
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "curl.exe -sSL https://raw.githubusercontent.com/youssefvdel/qwen-gate/main/install.ps1 | iex"
-```
-
-Or clone manually:
-
-```powershell
-git clone https://github.com/youssefvdel/qwen-gate.git
-cd qwen-gate
-bun install
-```
-
-Then run `qg` to start the server.
+This clones the repo, installs dependencies (Bun, Rust, Python+maturin, CMake, libclang), builds browser_oxide + Python bindings, creates `config.json`, and symlinks the `qg` / `qwengate` / `qwen-gate` CLI commands.
 
 ### Manual Install
 
 ```bash
-git clone https://github.com/youssefvdel/qwen-gate.git
-cd qwen-gate
+git clone https://github.com/Gautamgg7/qwen-gate-private.git
+cd qwen-gate-private
 bun install
 ```
 
@@ -79,30 +73,21 @@ bun install
 
 ```bash
 qg
-```
-
-Or:
-
-```bash
+# or
 bun start
 ```
 
 The server starts on [http://localhost:26405](http://localhost:26405).
 
-### Quick Commands (Windows PowerShell) — Start It Anytime
-
-Open PowerShell **in the project folder** (`cd C:\Users\akasa\Desktop\MYPROJECTS\ai\qwen-gate`):
+### Quick Commands
 
 | What you want | Command |
 |---|---|
 | **Start the server** | `bun start` |
 | Start with hot reload (auto-restart on code changes) | `bun dev` |
 | Check if the server is running | `bun run qg status` |
-| Stop the server | `Ctrl+C` in its terminal, or `Get-Process bun \| Stop-Process -Force` |
-| Restart | Stop it, then `bun start` again (accounts re-login automatically) |
 | Multi-core mode | `bun run cluster` |
 | Run all tests | `bun test` |
-| Auto-restart watchdog (survives crashes) | `powershell -ExecutionPolicy Bypass -File .\start-server.ps1` |
 
 After it starts:
 
@@ -110,11 +95,9 @@ After it starts:
 - **API base URL** (for OpenCode, Cursor, Claude Code, etc.): `http://localhost:26405/v1` — no API key needed unless you set `API_KEY` in `config.json`
 - **List available models**: `curl http://localhost:26405/v1/models`
 
-> **Use `localhost`, not `127.0.0.1`** in client configs — Bun binds the OS-resolved `localhost` (IPv6 on most Windows machines), so `127.0.0.1` may refuse to connect. `http://localhost:26405/v1` always works.
+> **Use `localhost`, not `127.0.0.1`** in client configs — Bun binds the OS-resolved `localhost` (IPv6 on some machines), so `127.0.0.1` may refuse to connect. `http://localhost:26405/v1` always works.
 
-> **If PowerShell says `bun` is not recognized:** Bun is installed at `C:\Users\akasa\.bun\bin` and is already on your user PATH — just **close and reopen VS Code / your terminal** so it picks up the updated PATH. Verify with `bun --version`.
-
-> **Accounts are persistent** — they live in `.qwen\accounts.json` (with browser sessions in `.qwen\browser-profiles\`), so after any restart all accounts log back in automatically. Add accounts once via the dashboard and they survive reboots.
+> **Accounts are persistent** — they live in `.qwen/accounts.json` (with browser sessions in `.qwen/browser-profiles/`), so after any restart all accounts log back in automatically. Add accounts once via the dashboard and they survive reboots.
 
 ### Add Accounts
 
@@ -130,7 +113,7 @@ After it starts:
 
 Qwen Gate works with any tool that speaks OpenAI's API: **Claude Code, OpenCode, Qwen Code, Cursor**, standard OpenAI SDKs (Python, Node.js, curl), and anything else using the `/v1/chat/completions` format — just point it at `http://localhost:26405/v1`.
 
-> **Tip:** Model IDs are fetched live from Qwen, and incoming names are auto-corrected (`Qwen3.8-Max`, `qwen3.8-max`, `qwen/qwen3.8-max` all work). Available models currently include `qwen3.8-max`, `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus`, `qwen3.5-plus`, and `qwen3.5-omni-plus` — see `http://localhost:26405/v1/models` for the live list.
+> **Tip:** Model IDs are fetched live from Qwen, and incoming names are auto-corrected (`Qwen3.8-Max`, `qwen3.8-max`, `qwen/qwen3.8-max` all work). Available models currently include `qwen3.8-max`, `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus`, `qwen3.5-plus`, `qwen3.5-flash`, and `qwen3.5-omni-plus` — see `http://localhost:26405/v1/models` for the live list.
 
 ### Chat Completion
 
@@ -139,7 +122,7 @@ curl -X POST http://localhost:26405/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer your-api-key" \
   -d '{
-    "model": "qwen3-max",
+    "model": "qwen3.5-flash",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 ```
@@ -151,25 +134,22 @@ Set `"stream": true` for SSE:
 ```bash
 curl -X POST http://localhost:26405/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-api-key" \
-  -d '{"model": "qwen3-max", "stream": true, "messages": [{"role": "user", "content": "Count to 5"}]}'
+  -d '{"model": "qwen3.5-flash", "stream": true, "messages": [{"role": "user", "content": "Count to 5"}]}'
 ```
 
 ### Tool Calling
 
-> **How it works:** Qwen doesn't natively support tool calling — it outputs tool calls as JSON text in its response. The gateway parses that text and converts it into OpenAI-compatible tool call objects. It's not perfect, but it works for most use cases.
-
 ```bash
 curl -X POST http://localhost:26405/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer your-api-key" \
   -d '{
-    "model": "qwen3-max",
+    "model": "qwen3.5-flash",
     "messages": [{"role": "user", "content": "Weather in Paris?"}],
     "tools": [{
       "type": "function",
       "function": {
         "name": "get_weather",
+        "description": "Get current weather in a city",
         "parameters": {
           "type": "object",
           "properties": {"city": {"type": "string"}},
@@ -180,42 +160,158 @@ curl -X POST http://localhost:26405/v1/chat/completions \
   }'
 ```
 
+### Image Support (Vision Models)
+
+```bash
+curl -X POST http://localhost:26405/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.7-plus",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Describe this image"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR..."}}
+      ]
+    }]
+  }'
+```
+
+### Using as Cline / OpenCode / Claude Code Replacement
+
+Point your AI coding agent at the qwen-gate API:
+
+```bash
+# OpenCode
+opencode --provider openai --base-url http://localhost:26405/v1 --model qwen3.5-flash
+
+# Claude Code (via OpenAI compatibility)
+claude-code --api-base http://localhost:26405/v1 --model qwen3.7-max
+
+# Cline (VS Code extension)
+# Set: API Provider = OpenAI Compatible
+# Base URL = http://localhost:26405/v1
+# Model = qwen3.5-flash
+```
+
 ## Configuration
 
 All settings in `config.json`. Key options:
 
-| Key                       | Default      | Description                                     |
-| ------------------------- | ------------ | ----------------------------------------------- |
-| `PORT`                    | `"26405"`    | Server port                                     |
-| `API_KEY`                 | `""`         | Bearer token for API auth (empty = no auth)     |
-| `BROWSER`                 | `"chromium"` | Browser engine: `chromium`, `firefox`, `webkit`, `chrome`, `edge` |
-| `TOOL_CALLING`            | `"true"`     | Enable tool call parsing                        |
-| `CLEAN_OUTPUT`            | `"true"`     | Strip internal artifacts from responses         |
-| `STREAMING_MODE`           | `"auto"`     | Streaming mode: `auto`, `on`, `off`             |
-| `SAVE_REQUEST_LOGS`       | `"false"`    | Save per-request logs to disk                   |
-| `OPEN_DASHBOARD_ON_START` | `"false"`    | Auto-open dashboard in browser                  |
-| `RATE_LIMIT_COOLDOWN_MS`  | `"120000"`   | Cooldown after rate limit (2 min)               |
-| `RETRY_MAX_ATTEMPTS`      | `"3"`        | Max retry attempts                              |
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PORT` | `"26405"` | Server port |
+| `API_KEY` | `""` | Bearer token for API auth (empty = no auth) |
+| `TOOL_CALLING` | `"true"` | Enable tool call parsing |
+| `CLEAN_OUTPUT` | `"true"` | Strip internal artifacts from responses |
+| `STREAMING_MODE` | `"auto"` | Streaming mode: `auto`, `on`, `off` |
+| `QWEN_FETCH_TIMEOUT_MS` | `"60000"` | Per-request timeout (was 30000, increased for file upload) |
+| `STREAM_IDLE_TIMEOUT_MS` | `"300000"` | Stream idle timeout (5 min for thinking models) |
+| `MAX_REQUEST_ACCOUNT_ATTEMPTS` | `"5"` | Max account retries per request |
+| `SESSION_POOL_SIZE` | `"2"` | Pre-warmed sessions per account |
+| `CONVERSATION_REUSE` | `"true"` | Reuse sessions for multi-turn conversations |
+| `MAX_INLINE_CHARS` | `"120000"` | Max inline chars before file upload |
+| `CONTEXT_COMPRESSION_THRESHOLD` | `"150000"` | Token threshold for history compression |
 
-> **Note:** This is a partial list of 10 commonly-used keys. See `ConfigSchema` in `src/services/configService.ts` for the full list.
+### Environment Variables (Circuit Breaker)
 
-## Architecture
+The circuit breaker is configurable via env vars — useful for agent/CI mode:
 
-<p align="center">
-  <img src="media/architecture.svg" alt="Qwen Gate Architecture Diagram" width="100%">
-</p>
+| Env Var | Default | Description |
+|---------|---------|-------------|
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | Failures before opening circuit (set to `999` to disable) |
+| `CIRCUIT_BREAKER_RESET_TIMEOUT_MS` | `30000` | Time before circuit resets |
+| `CIRCUIT_BREAKER_HALF_OPEN_MAX` | `1` | Max attempts in half-open state |
+
+## Browser Backend Architecture
+
+Qwen Gate uses a tiered browser backend for stealth HTTP requests (needed when Qwen's WAF blocks the regular `wreq-js` requests):
+
+```
+                          ┌─ qwen-gate (TypeScript/Bun) ─┐
+                          │  browserChatFetch.ts tries:  │
+                          │   1. browser_oxide (Python)  │ ──subprocess──┐
+                          │   2. cloakbrowser (fallback)│                │
+                          └──────────────────────────────┘                ▼
+                                                          ┌─ Python (PyO3) ─┐
+                                                          │ browser_oxide   │
+                                                          │ Python bindings │
+                                                          └─────────────────┘
+                                                                │ FFI
+                                                                ▼
+                                                          ┌─ Rust engine ───┐
+                                                          │ browser_oxide   │
+                                                          │ (BoringSSL+V8)  │
+                                                          └─────────────────┘
+```
+
+### Backends (in order of preference)
+
+1. **browser_oxide** (Rust stealth engine via Python bindings)
+   - Native BoringSSL TLS fingerprint (JA3/JA4)
+   - V8 JavaScript runtime (deno_core)
+   - Real HTML/CSS/DOM/canvas
+   - ~15x lighter than headless Chrome
+   - Repo: https://github.com/yfedoseev/browser_oxide
+   - Invoked via `python3 -c "..."` subprocess
+
+2. **cloakbrowser** (stealth Chromium, fallback)
+   - Persistent browser profile for login
+   - Used when browser_oxide is not available
+   - Heavier (~2GB memory) but always works
+
+### WAF Detection & Recovery
+
+Qwen's baxia anti-bot system can block requests with HTTP 200 + JSON body:
+```json
+{"ret":["FAIL_SYS_USER_VALIDATE","RGV587_ERROR::SM::..."],"data":{"url":"..."}}
+```
+
+Qwen Gate handles this by:
+1. Detecting WAF patterns in response bodies (`FAIL_SYS_USER_VALIDATE`, `RGV587_ERROR`, `_____tmd_____`, `x5secdata`)
+2. Invalidating bx-ua/bx-pp tokens
+3. Triggering browser cookie refresh
+4. Retrying with fresh tokens
+5. Falling back to browser chat fetch (browser_oxide → cloakbrowser)
+6. Not throttling the account (WAF is a token issue, not an account issue)
+
+## Key Bug Fixes Applied
+
+This fork includes comprehensive bug fixes over the original upstream:
+
+### 1. File Upload / Parse Timeouts (CRITICAL)
+- `parseFile` now retries up to 3 times with 60s per-attempt timeout (was 30s, no retry)
+- `pollParseStatus` adaptive wait: floor 5s→10s, max 30s→90s
+- File size scaling: 40KB/sec → 20KB/sec
+
+### 2. Stuck inFlight Counter Leak (HIGH)
+- `incrementInFlight` now sets `lastInFlightAt` (was missing)
+- Stuck-detection threshold 60s → 30s (faster recovery)
+- Safety-valve cap 20 → 10
+
+### 3. Empty Stream/Response Guard (CRITICAL)
+- Deep empty-stream detection: scans SSE data frames for actual content
+- Non-streaming empty-result guard: returns 502 instead of fake success
+- Non-streaming handler handles OpenAI-format chunks (no phase field)
+
+### 4. WAF Baxia Challenge Detection (CRITICAL)
+- WAF-in-body sniffer now runs for streaming requests too
+- Expanded WAF patterns: `RGV587_ERROR`, `_____tmd_____`, `x5secdata`
+- Browser cookie refresh on WAF detection
+- WAF challenge does NOT throttle account (token issue, not account issue)
+- Single-account retry when no other accounts available
 
 ## Web Dashboard
 
 Accessible at `http://localhost:26405/dashboard`.
 
-| Page         | Path                  | Purpose                                              |
-| ------------ | --------------------- | ---------------------------------------------------- |
-| **Overview** | `/dashboard`          | KPIs, model health, system logs, session pool status |
-| **Logs**     | `/dashboard/logs`     | Real-time request log with expandable entry details  |
-| **Accounts** | `/dashboard/accounts` | Add/remove Qwen accounts, view auth status           |
-| **Network**  | `/dashboard/network`  | Outbound API call inspector                          |
-| **Settings** | `/dashboard/settings` | Live config editor (changes apply instantly)         |
+| Page | Path | Purpose |
+|------|------|---------|
+| **Overview** | `/dashboard` | KPIs, model health, system logs, session pool status |
+| **Logs** | `/dashboard/logs` | Real-time request log with expandable entry details |
+| **Accounts** | `/dashboard/accounts` | Add/remove Qwen accounts, view auth status |
+| **Network** | `/dashboard/network` | Outbound API call inspector |
+| **Settings** | `/dashboard/settings` | Live config editor (changes apply instantly) |
 
 ## CLI
 
@@ -239,148 +335,50 @@ Options:
 Account management is done via the web dashboard → Accounts page.
 ```
 
-## Updating
-
-### Via CLI (easiest)
-
-```bash
-qg update
-```
-
-This runs `git pull --ff-only && bun install`. Then restart the server:
-
-```bash
-qg restart
-```
-
-### Manual
-
-```bash
-git pull && bun install && qg restart
-```
-
-### Re-run the installer
-
-```bash
-# Linux / macOS
-curl -sSL https://raw.githubusercontent.com/youssefvdel/qwen-gate/main/install.sh | bash
-
-# Windows (PowerShell)
-powershell -ExecutionPolicy Bypass -c "curl.exe -sSL https://raw.githubusercontent.com/youssefvdel/qwen-gate/main/install.ps1 | iex"
-```
-
-The server checks for new GitHub releases on startup and logs a warning in the dashboard when an update is available.
-
-## Project Structure
-
-```text
-src/
-├── cli.ts                   CLI entry (qg command parser)
-├── cluster.ts               Multi-core cluster mode
-├── index.tsx                Hono server, routing, CORS, auth
-├── models.json              Model definitions (context lengths, modalities)
-├── routes/                  API route handlers
-│   ├── chat.ts              Chat completions dispatch
-│   ├── chatHelpers.ts       Chat request orchestration helpers
-│   ├── chatStreaming.ts     Streaming SSE logic
-│   ├── chatNonStreaming.ts  Non-streaming responses
-│   ├── chatHelpersCore.ts   Core chat response handling
-│   ├── chatStreamingHelpers.ts Streaming helper utilities
-│   ├── cleanupHelpers.ts    Cleanup logic
-│   ├── compressToolResult.ts Tool result compression
-│   ├── streamLoop.ts        Streaming loop with idle timeout
-│   ├── writeHelpers.ts      Write helper utilities
-│   ├── accounts.ts          Account CRUD API
-│   ├── config.ts            Config read/write API
-│   └── dashboard/           Web dashboard (vanilla HTML/JS)
-│       ├── accounts.ts      Account management page
-│       ├── dashboardRoutes.ts  Dashboard routing hub
-│       ├── logs.ts          Request log page
-│       ├── monitor.ts       Real-time monitoring page
-│       ├── network.ts       Network debug page
-│       ├── overview.ts      Dashboard overview/KPI page
-│       ├── settings.ts      Settings page
-│       ├── sidebar.ts       Sidebar navigation
-│       └── public/          Static dashboard assets (JS/CSS/SVG)
-├── services/                Business logic
-│   ├── accountManager.ts    Account CRUD, round-robin rotation
-│   ├── auth.test.ts         Auth test suite
-│   ├── auth.ts              Auth orchestration
-│   ├── browserlessFetch.ts  Browserless fetch transport
-│   ├── browserProfiles.ts   Browser profile management
-│   ├── bxTokenExtractor.ts  Browserless token extraction
-│   ├── bxUaGenerator.test.ts User-agent generator tests
-│   ├── bxUaGenerator.ts     User-agent generation
-│   ├── configService.test.ts Config service tests
-│   ├── configService.ts     Config loader
-│   ├── defaultSystemPrompt.ts Default system prompt
-│   ├── fireyejsRunner.ts    FireyeJS sandbox runner
-│   ├── logStore.test.ts     Log store tests
-│   ├── logStore.ts          In-memory log store + SSE
-│   ├── loginHelpers.ts      Login helper utilities
-│   ├── loginService.ts      Login orchestration service
-│   ├── modelHealth.ts       Model health tracking
-│   ├── modelRouter.ts       Model routing & fallback
-│   ├── monitorStore.ts      Monitoring data store
-│   ├── networkDebug.ts      Outbound call capture
-│   ├── playwright.ts        Browser init & management
-│   ├── qwen.ts              Qwen API interaction
-│   ├── qwenFileUpload.ts    Qwen file upload handling
-│   ├── qwenLogger.ts        Qwen-specific logging
-│   ├── qwenModels.ts        Model fetching & mapping
-│   ├── sessionPool.ts       Session pool with autoscaling
-│   ├── systemLogger.ts      System-wide logger
-│   ├── tokenCache.ts        Token caching layer
-│   └── tokenRefresh.ts      Token refresh logic
-├── tools/                   Tool calling system
-│   ├── registry.ts          Tool registry
-│   ├── xmlToolParser.ts     XML tool call parsing
-│   ├── guard.ts             Spam/abuse guard
-│   ├── schema.ts            JSON Schema validation
-│   └── schemaValidators.ts  Schema validation helpers
-├── utils/                   Shared utilities
-│   ├── auth.ts              Auth utilities
-│   ├── contentFilter.ts     Streaming content filter
-│   ├── paths.ts             Path utilities
-│   ├── retry.ts             Exponential backoff
-│   ├── tagNames.ts          Centralized tag names
-│   ├── thinkTagStripper.ts  Think tag stripping
-│   ├── tokenEstimator.ts    Token estimation
-│   ├── version.ts           Version information
-│   ├── xmlStripper.ts       XML/tool call artifact removal
-│   └── xmlStripper.test.ts  XML stripper tests
-├── tests/                   Integration tests
-├── types/                   TypeScript interfaces
-└── middleware/
-    └── rateLimit.ts         Token bucket rate limiter
-```
-
 ## Testing
 
 ```bash
+# Unit tests (154 tests)
 bun test
+
+# Integration test script
+bash scripts/test-api.sh
 ```
 
-Uses Bun's built-in test runner. Covers content filtering, tool-call parsing, streaming sanitization, bx-ua generation, and config service.
+154/154 unit tests pass. Covers content filtering, tool-call parsing, streaming sanitization, bx-ua generation, config service, Anthropic format conversion, and more.
+
+## GitHub Actions CI
+
+The `.github/workflows/ci.yml` workflow has 3 jobs:
+
+1. **test** — runs unit tests (154 tests, always passes)
+2. **build-browser-oxide** — builds the Rust binary + Python bindings (~30 min)
+3. **integration-test** — end-to-end test with Qwen accounts from secrets
+
+To enable integration tests, add these secrets:
+- `QWEN_ACCOUNTS_JSON` — JSON array of `[{email, password}, ...]`
+- `ACCOUNT1`, `ACCOUNT2`, `ACCOUNT3` — `email:password` format
 
 ## Documentation
 
-| Document                             | Description                                   |
-| ------------------------------------ | --------------------------------------------- |
-| [Architecture](docs/ARCHITECTURE.md) | System design, component breakdown, data flow |
-| [API Reference](docs/API.md)         | Full endpoint documentation                   |
-| [Deployment](docs/DEPLOYMENT.md)     | Production deployment guide                   |
-| [Development](docs/DEVELOPMENT.md)   | Contributing, testing, code conventions       |
+| Document | Description |
+|----------|-------------|
+| [Architecture](ARCHITECTURE.md) | Browser backend architecture, Rust + Python integration |
+| [Bugfix Summary](BUGFIX_SUMMARY.md) | Detailed list of all bug fixes applied |
+| [API Reference](docs/API.md) | Full endpoint documentation |
+| [Deployment](docs/DEPLOYMENT.md) | Production deployment guide |
+| [Development](docs/DEVELOPMENT.md) | Contributing, testing, code conventions |
 
-## Star History
+## Related Repos
 
-<a href="https://www.star-history.com/?repos=youssefvdel%2Fqwengate&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=youssefvdel/qwen-gate&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=youssefvdel/qwen-gate&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=youssefvdel/qwen-gate&type=date&legend=top-left" />
- </picture>
-</a>
+| Repo | Description |
+|------|-------------|
+| [qwen-gate-private](https://github.com/Gautamgg7/qwen-gate-private) | This repo — main API gateway (TypeScript/Bun) |
+| [qwen-gate-test-project](https://github.com/Gautamgg7/qwen-gate-test-project) | Test project with 50-prompt agent test + 14 integration tests |
+
+## Upstream
+
+Based on [youssefvdel/qwen-gate](https://github.com/youssefvdel/qwengate) — the original OpenAI-compatible API gateway for Qwen models.
 
 ## License
 
