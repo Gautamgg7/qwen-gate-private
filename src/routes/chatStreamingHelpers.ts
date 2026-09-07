@@ -94,6 +94,8 @@ export interface StreamProcessingState {
   upstreamError?: string;
   /** Depth tracking for nested tool call XML blocks. >0 means suppress content emission. */
   toolCallDepth: number;
+  /** Pre-request estimate of prompt tokens (before usage feedback overwrites promptTokens). */
+  initialPromptTokenEstimate?: number;
   /**
    * One-chunk buffer for handling XML tag splits across SSE chunk boundaries.
    * When a chunk contains `<` without `>`, it might be a tag split (e.g. `<func` + `tion=read>`).

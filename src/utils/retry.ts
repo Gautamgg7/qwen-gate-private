@@ -246,7 +246,12 @@ export function isRetryable(error: unknown, httpStatus?: number): boolean {
       msg.includes('bad gateway') ||
       msg.includes('service unavailable') ||
       msg.includes('gateway timeout') ||
-      msg.includes('internal server error')
+      msg.includes('internal server error') ||
+      // D7: wreq-js tokio epoll/Bun crash — transient, the next attempt creates
+      // a fresh wreq session which avoids the stale socket that caused the crash
+      msg.includes('bad file descriptor') ||
+      msg.includes('tokio') ||
+      msg.includes('epoll')
     ) {
       return true;
     }

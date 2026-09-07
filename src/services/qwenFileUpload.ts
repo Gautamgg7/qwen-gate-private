@@ -215,12 +215,17 @@ interface ParseStatusResponse {
   status: 'running' | 'success' | 'failed';
 }
 
-async function pollParseStatus(email: string, fileId: string, maxWaitMs = 5_000): Promise<void> {
+async function pollParseStatus(email: string, fileId: string, maxWaitMs = 5_000, fileSize = 0): Promise<void> {
   const url = `${QWEN_API_BASE}/api/v2/files/parse/status`;
   const startTime = Date.now();
   const pollInterval = 1_000;
 
-  while (Date.now() - startTime < maxWaitMs) {
+  // Adaptive wait: large context files take longer to parse on Qwen's side.
+  // A fixed 5s floor was too short for multi-hundred-KB files (the model was
+  // called before parsing finished, which correlates with empty responses).
+  const adaptiveMs = Math.min(30_000, Math.max(maxWaitMs, Math.round((fileSize / 40_000) * 1000)));
+
+  while (Date.now() - startTime < adaptiveMs) {
     const body = JSON.stringify({ file_id_list: [fileId] });
 
     const tokenInfo = await getTokenWithAccount(email);
@@ -255,7 +260,7 @@ async function pollParseStatus(email: string, fileId: string, maxWaitMs = 5_000)
     await Bun.sleep(pollInterval);
   }
 
-  logStore.log('warn', 'upload', `[FileUpload] Parse poll timed out after ${Date.now() - startTime}ms for ${fileId}`);
+  logStore.log('warn', 'upload', `[FileUpload] Parse poll timed out after ${Date.now() - startTime}ms for ${fileId} (was waiting up to ${adaptiveMs}ms)`);
   // ponytail: file upload succeeded, parse may still finish async.
   // Qwen will include the file content once parsing completes on its side.
 }
@@ -298,8 +303,8 @@ async function uploadFileContent(
     await parseFile(email, sts.file_id);
     logStore.log('debug', 'upload', `[FileUpload] Parse triggered for ${sts.file_id}`);
 
-    // Step 4: Poll until parsed
-    await pollParseStatus(email, sts.file_id);
+    // Step 4: Poll until parsed (adaptive wait based on file size)
+    await pollParseStatus(email, sts.file_id, 5_000, fileSize);
     logStore.log('debug', 'upload', `[FileUpload] Parse complete for ${sts.file_id}`);
   }
 
@@ -370,8 +375,41 @@ export async function uploadLargeTextAsFile(email: string, text: string, fileNam
   const encoder = new TextEncoder();
   const content = encoder.encode(text);
   const contentType = 'text/plain';
-  return uploadFileContent(email, Buffer.from(content), fileName, contentType, 'document', 'file');
+
+  // B3: Content-hash reuse — if the exact same blob was uploaded to this
+  // account before, reuse the cached attachment instead of re-uploading.
+  // Agents re-send the same conversation history every turn, so this saves
+  // 4+ RTTs (STS + OSS upload + parse + parse-status poll) per repeated turn.
+  const hash = crypto.createHash('sha256').update(content).digest('hex');
+  const cacheKey = `${email.toLowerCase().trim()}::${hash}`;
+  const cached = contextFileCache.get(cacheKey);
+  if (cached && Date.now() - cached.createdAt < CONTEXT_FILE_CACHE_TTL_MS) {
+    return cached.attachment;
+  }
+
+  const attachment = await uploadFileContent(email, Buffer.from(content), fileName, contentType, 'document', 'file');
+
+  // Cache with size cap (LRU-style: oldest entry evicted)
+  if (contextFileCache.size >= CONTEXT_FILE_CACHE_MAX) {
+    let oldestKey: string | undefined;
+    let oldestTs = Number.POSITIVE_INFINITY;
+    for (const [k, v] of contextFileCache) {
+      if (v.createdAt < oldestTs) {
+        oldestTs = v.createdAt;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey) contextFileCache.delete(oldestKey);
+  }
+  contextFileCache.set(cacheKey, { attachment, createdAt: Date.now() });
+
+  return attachment;
 }
+
+/** Per-account content-hash cache for context.txt uploads (B3). */
+const contextFileCache = new Map<string, { attachment: QwenFileAttachment; createdAt: number }>();
+const CONTEXT_FILE_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const CONTEXT_FILE_CACHE_MAX = 50;
 
 /**
  * Download an image (data URI or remote URL) and upload it to Qwen's file system.

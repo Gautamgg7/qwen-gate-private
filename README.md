@@ -89,6 +89,33 @@ bun start
 
 The server starts on [http://localhost:26405](http://localhost:26405).
 
+### Quick Commands (Windows PowerShell) — Start It Anytime
+
+Open PowerShell **in the project folder** (`cd C:\Users\akasa\Desktop\MYPROJECTS\ai\qwen-gate`):
+
+| What you want | Command |
+|---|---|
+| **Start the server** | `bun start` |
+| Start with hot reload (auto-restart on code changes) | `bun dev` |
+| Check if the server is running | `bun run qg status` |
+| Stop the server | `Ctrl+C` in its terminal, or `Get-Process bun \| Stop-Process -Force` |
+| Restart | Stop it, then `bun start` again (accounts re-login automatically) |
+| Multi-core mode | `bun run cluster` |
+| Run all tests | `bun test` |
+| Auto-restart watchdog (survives crashes) | `powershell -ExecutionPolicy Bypass -File .\start-server.ps1` |
+
+After it starts:
+
+- **Dashboard**: http://localhost:26405/dashboard (manage accounts, view logs, settings)
+- **API base URL** (for OpenCode, Cursor, Claude Code, etc.): `http://localhost:26405/v1` — no API key needed unless you set `API_KEY` in `config.json`
+- **List available models**: `curl http://localhost:26405/v1/models`
+
+> **Use `localhost`, not `127.0.0.1`** in client configs — Bun binds the OS-resolved `localhost` (IPv6 on most Windows machines), so `127.0.0.1` may refuse to connect. `http://localhost:26405/v1` always works.
+
+> **If PowerShell says `bun` is not recognized:** Bun is installed at `C:\Users\akasa\.bun\bin` and is already on your user PATH — just **close and reopen VS Code / your terminal** so it picks up the updated PATH. Verify with `bun --version`.
+
+> **Accounts are persistent** — they live in `.qwen\accounts.json` (with browser sessions in `.qwen\browser-profiles\`), so after any restart all accounts log back in automatically. Add accounts once via the dashboard and they survive reboots.
+
 ### Add Accounts
 
 > **⚠️ Best practice:** Use **3+ accounts** for round-robin rotation to bypass cooldown limits. Do **not** use your personal Qwen account — create dedicated accounts.
@@ -103,7 +130,7 @@ The server starts on [http://localhost:26405](http://localhost:26405).
 
 Qwen Gate works with any tool that speaks OpenAI's API: **Claude Code, OpenCode, Qwen Code, Cursor**, standard OpenAI SDKs (Python, Node.js, curl), and anything else using the `/v1/chat/completions` format — just point it at `http://localhost:26405/v1`.
 
-> **Tip:** Use `model: "qwen3-7-max"` for the latest Qwen model. Available models: `qwen3-7-max`, `qwen3-6-plus`, `qwen3-max`, `qwen3-coder`, `qwen3-5-plus`, `qwen3-5-flash`, and more.
+> **Tip:** Model IDs are fetched live from Qwen, and incoming names are auto-corrected (`Qwen3.8-Max`, `qwen3.8-max`, `qwen/qwen3.8-max` all work). Available models currently include `qwen3.8-max`, `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus`, `qwen3.5-plus`, and `qwen3.5-omni-plus` — see `http://localhost:26405/v1/models` for the live list.
 
 ### Chat Completion
 

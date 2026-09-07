@@ -123,14 +123,24 @@ async function doUpdate() {
 
 async function checkStatus() {
   const port = process.env.PORT || DEFAULT_PORT;
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(5000) });
-    if (res.ok) {
-      out(`Server is running on port ${port}`);
-      return;
+  // Probe the lightweight /ping endpoint (never /v1/models — it can hit the
+  // Qwen upstream and exceed the timeout). The server binds the OS-resolved
+  // `localhost`, which may be IPv6-only, so try several addresses.
+  const candidates = [
+    `http://localhost:${port}/ping`,
+    `http://[::1]:${port}/ping`,
+    `http://127.0.0.1:${port}/ping`,
+  ];
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (res.ok) {
+        out(`Server is running on port ${port}`);
+        return;
+      }
+    } catch {
+      // try next candidate
     }
-  } catch {
-    // Server not running
   }
   err('Server is not running');
   process.exit(1);

@@ -12,7 +12,7 @@
  *   browser dependency — runs once per 30 min per account.
  */
 import { resolve } from 'path';
-import { getBxUaToken } from './bxUaGenerator.ts';
+import { getBxUaToken, resetCache } from './bxUaGenerator.ts';
 import { logStore } from './logStore.ts';
 import { QWEN_API_BASE } from './qwen.ts';
 import { tokenCache } from './tokenCache.ts';
@@ -52,6 +52,11 @@ export async function generateBxUa(): Promise<string | null> {
     logStore.log('error', 'fireyejs', `bx-ua generation failed: ${msg}`);
     return null;
   }
+}
+
+export function resetBxUaCache(): void {
+  tokenCache.delete('bx-ua');
+  resetCache();
 }
 
 // ─── bx-pp generation (Phase C) ──────────────────────────────────────────────

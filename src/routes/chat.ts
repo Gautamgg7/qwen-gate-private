@@ -18,6 +18,7 @@ import {
   createQwenStreamWithRetry,
   getModelSpecs,
   handleImageModelFallback,
+  resolveModelName,
 } from './chatHelpers.ts';
 import { handleNonStreamingRequest } from './chatNonStreaming.ts';
 import { handleStreamingRequest } from './chatStreaming.ts';
@@ -43,6 +44,11 @@ async function parseRequestBody(c: Context) {
   }
 
   const body = validation.data as unknown as OpenAIRequest;
+
+  // Canonicalize client model names ("Qwen3.8-Max", "qwen/qwen3.8-max", …)
+  // to Qwen's exact upstream ID — Qwen rejects anything else with
+  // "Not_Found: Model not found".
+  body.model = await resolveModelName(body.model);
 
   // Per-message size validation to prevent OOM during estimateTokens
   if (body.messages && Array.isArray(body.messages)) {
@@ -88,7 +94,52 @@ async function parseRequestBody(c: Context) {
   };
 }
 
-async function setupSession(messages: any[], body: OpenAIRequest, availableTokens: number, toolCalling: boolean, logId: string) {
+/**
+ * Hierarchical context compression (C3).
+ *
+ * When the estimated token count exceeds the compression threshold, older
+ * conversation turns are collapsed into compact one-line digests while recent
+ * turns stay verbatim. This preserves task context (the model can still see
+ * what happened before) while cutting the prompt size enough to fit the
+ * inline budget and keep TTFT low.
+ *
+ * The segment format matches buildQwenMessages output: `<user>…</user>` and
+ * `<assist>…</assist>` blocks separated by blank lines.
+ */
+function compressHistorySegments(inlineContent: string): string {
+  const parts = inlineContent.split(/\n\n(?=<user>|<assist>)/);
+  if (parts.length < 6) return inlineContent; // too few turns to benefit
+
+  // Keep the first segment (the task) and the last 4 segments verbatim;
+  // collapse everything in between into one-line summaries.
+  const KEEP_RECENT = 4;
+  const keepHead = parts[0];
+  const keepTail = parts.slice(-KEEP_RECENT);
+  const middle = parts.slice(1, -KEEP_RECENT);
+
+  if (middle.length === 0) return inlineContent;
+
+  const summaries = middle.map((seg) => {
+    const roleMatch = seg.match(/^<(user|assist)>/);
+    const role = roleMatch ? roleMatch[1] : 'turn';
+    // Extract first meaningful line as digest
+    const inner = seg.replace(/^<(?:user|assist)>\n?/, '').replace(/\n<\/(?:user|assist)>\s*$/, '');
+    const firstLine = inner.split('\n').find((l) => l.trim().length > 0) || '';
+    const digest = firstLine.trim().substring(0, 200) + (inner.length > 200 ? '…' : '');
+    return `<turn_summary role="${role}">${digest}</turn_summary>`;
+  });
+
+  const compressed = [
+    keepHead,
+    `[COMPRESSED HISTORY — ${middle.length} older turns summarized below]`,
+    ...summaries,
+    ...keepTail,
+  ].join('\n\n');
+
+  return compressed;
+}
+
+async function setupSession(messages: any[], body: OpenAIRequest, availableTokens: number, toolCalling: boolean, logId: string, estimatedPromptTokens: number = 0) {
   // ── Image detection ──────────────────────────────────────────
   // Only scan the LAST message — previous turns already uploaded their images
   let hasImages = false;
@@ -122,12 +173,24 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     toolResultsContent,
   } = buildQwenMessages(cleanedMessages, body, availableTokens, toolCalling);
 
-  // ── Inline content truncation ─────────────────────────────────
-  // Keep the most recent ~50k characters inline; push older history
-  // into context.txt so the model can reference it when needed.
-  const MAX_INLINE_CHARS = 50000;
+  // ── Inline content truncation (C2 — configurable) ────────────────
+  // Keep the most recent N characters inline; push older history into
+  // context.txt so the model can reference it when needed.
+  const MAX_INLINE_CHARS = config.getInt('MAX_INLINE_CHARS', 120_000);
   let inlineContent = processedMessages[0].content as string;
   let chatHistoryContent = '';
+
+  // ── Hierarchical context compression (C3) ─────────────────────────
+  // When the estimated token count blows past the compression threshold,
+  // older conversation turns are collapsed into compact one-line digests.
+  // Recent turns stay verbatim so the model keeps full fidelity on the
+  // current task while old turns remain referenceable via summaries.
+  const compressionThreshold = config.getInt('CONTEXT_COMPRESSION_THRESHOLD', 150_000);
+  if (typeof inlineContent === 'string' && estimatedPromptTokens > compressionThreshold) {
+    inlineContent = compressHistorySegments(inlineContent);
+    processedMessages[0] = { ...processedMessages[0], content: inlineContent };
+    logStore.log('info', 'chat', `[Chat] Context compression applied: ${estimatedPromptTokens} est. tokens > ${compressionThreshold} threshold`);
+  }
 
   if (typeof inlineContent === 'string' && inlineContent.length > MAX_INLINE_CHARS) {
     // Split on message boundaries: \n\n followed by <user> or <assist>
@@ -154,6 +217,23 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       processedMessages[0] = { ...processedMessages[0], content: inlineContent };
     }
   }
+
+  // ── Conversation key (B2) ─────────────────────────────────────────
+  // Hash the first user message + model to create a stable conversation key.
+  // Agent loops (OpenCode, Claude Code) resend the same task prompt across
+  // turns, so the key stays stable and the session is reused (parent_id
+  // continuation + warm pool + no /chats/new on repeat turns).
+  const firstUserContent = messages.find((m: any) => m.role === 'user')?.content;
+  const firstUserStr = typeof firstUserContent === 'string'
+    ? firstUserContent
+    : Array.isArray(firstUserContent)
+      ? firstUserContent.map((c: any) => c.text || JSON.stringify(c)).join('\n')
+      : JSON.stringify(firstUserContent ?? '');
+  const conversationKey = crypto
+    .createHash('sha256')
+    .update(`${body.model}::${firstUserStr.substring(0, 2000)}`)
+    .digest('hex')
+    .slice(0, 16);
 
   // File upload happens inside retry loop using the same account as the request
   // (accounts can't access files uploaded by other accounts — must share the account)
@@ -225,7 +305,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
 
     let sessionResult;
     try {
-      sessionResult = await acquireSessionWithCorrections(accountEmail, processedMessages);
+      sessionResult = await acquireSessionWithCorrections(accountEmail, processedMessages, conversationKey);
     } catch (err) {
       lastFailedEmail = accountEmail;
       lastError = err;
@@ -339,11 +419,140 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     }
     clearTimeout(firstChunkTimer);
 
-    // Reconstruct stream with the first chunk prepended, then pipe remaining data through.
-    // This lets us keep the first chunk (already read) while allowing async consumption.
+    // ── Empty-stream guard (FIX) ─────────────────────────────────────
+    // Qwen sometimes returns HTTP 200 with an EMPTY body — the upstream SSE
+    // ends instantly with zero content/tool-calls, and the client (OpenCode)
+    // sees a "successful" but empty turn. Detect an empty first chunk and
+    // retry on the next account instead of emitting a fake completion.
+    const firstChunkEmpty =
+      firstChunk.done || !firstChunk.value || firstChunk.value.length === 0;
+    if (firstChunkEmpty) {
+      logStore.log(
+        'warn',
+        'chat',
+        `[Chat] Empty first chunk from ${resolvedEmail} — upstream 200 with empty body (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES})`,
+      );
+      logStore.addError(logId, `Empty upstream body from ${resolvedEmail}`);
+      streamReader.cancel().catch(() => {});
+      qwenAbortController?.abort();
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+      lastFailedEmail = resolvedEmail;
+      lastError = new Error(`Qwen returned an empty response body (${resolvedEmail})`);
+      if (resolvedEmail) {
+        try {
+          const { recordAccountFailure } = await import('../services/auth.ts');
+          recordAccountFailure(resolvedEmail);
+        } catch {
+          /* best effort */
+        }
+      }
+      continue;
+    }
+
+    // ── Content probe (deeper empty-stream fix) ──────────────────────
+    // The first chunk can carry SSE framing bytes (heartbeats / partial
+    // frames) and still pass the empty-first-chunk guard, while the upstream
+    // ends instantly with ZERO real data frames — the client then sees a
+    // "successful" but empty turn. Before committing to this account, keep
+    // reading until a real data frame arrives or the stream ends (bounded
+    // deadline). No real data → treat as empty response and retry on the
+    // next account: nothing has been written to the client yet, so the
+    // failover is completely transparent to OpenCode.
+    const probeChunks: Uint8Array[] = [];
+    if (!firstChunk.done && firstChunk.value) probeChunks.push(firstChunk.value);
+    const probeDecoder = new TextDecoder();
+    const hasRealSseData = (text: string): boolean => {
+      for (const line of text.split('\n')) {
+        const l = line.trim();
+        if (!l.startsWith('data:')) continue;
+        const payload = l.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+        try {
+          const obj = JSON.parse(payload);
+          // Qwen data frames: {choices:[{delta:{...}}]}, {response_id},
+          // {response:{created}}, {usage}, {error} — any of these means the
+          // stream is actually delivering content.
+          if (obj?.choices?.[0]?.delta) return true;
+          if (obj?.response_id || obj?.['response.created']?.response_id) return true;
+          if (obj?.usage || obj?.error) return true;
+        } catch {
+          /* partial JSON line — keep probing */
+        }
+      }
+      return false;
+    };
+    let probeText = firstChunk.done ? '' : probeDecoder.decode(firstChunk.value, { stream: true });
+    let sawRealData = hasRealSseData(probeText);
+    const PROBE_DEADLINE_MS = 20_000;
+    const probeDeadline = Date.now() + PROBE_DEADLINE_MS;
+    while (!sawRealData) {
+      const remainingMs = probeDeadline - Date.now();
+      if (remainingMs <= 0) {
+        logStore.log('warn', 'chat', `[Chat] Content probe deadline hit (${PROBE_DEADLINE_MS / 1000}s, no data frame) from ${resolvedEmail}`);
+        break;
+      }
+      const probeResult: any = await Promise.race([
+        streamReader.read(),
+        new Promise((resolve) => setTimeout(() => resolve({ done: true, value: undefined }), remainingMs)),
+      ]);
+      if (probeResult.value) {
+        probeChunks.push(probeResult.value);
+        probeText += probeDecoder.decode(probeResult.value, { stream: true });
+        sawRealData = hasRealSseData(probeText);
+      }
+      if (probeResult.done) break; // upstream ended (or deadline) with no data frame
+    }
+    if (!sawRealData) {
+      // Non-SSE JSON body (e.g. {"success":false,data:{code:"RateLimited",...}})
+      // — NOT an empty stream. The downstream JSON-error translation maps this
+      // to a proper 4xx/5xx response, so hand the buffered bytes through
+      // unchanged instead of treating it as an empty response.
+      const probeTrimmed = probeText.trimStart();
+      const looksLikeJsonBody =
+        (probeTrimmed.startsWith('{') || probeTrimmed.startsWith('[')) &&
+        !probeText.includes('data:');
+      if (!looksLikeJsonBody) {
+      // FAIL_SYS_USER_VALIDATE = Aliyun WAF rejected our bx-ua/bx-pp token —
+      // NOT an account problem. Invalidate the cached bx-ua so the next
+      // attempt (this or another account) generates a fresh token.
+      const wafRejected = probeText.includes('FAIL_SYS_USER_VALIDATE');
+      if (wafRejected) {
+        try {
+          const { resetBxUaCache } = await import('../services/fireyejsRunner.ts');
+          resetBxUaCache();
+          logStore.log('warn', 'chat', `[Chat] WAF token rejection (FAIL_SYS_USER_VALIDATE) — bx-ua cache invalidated, next attempt regenerates`);
+        } catch {
+          /* best effort */
+        }
+      }
+      logStore.log(
+        'warn',
+        'chat',
+        `[Chat] Empty content probe from ${resolvedEmail} — upstream 200 with no data frames (attempt ${attempt + 1}/${MAX_ACCOUNT_RETRIES}). First bytes: ${JSON.stringify(probeText.slice(0, 400))}`,
+      );
+      logStore.addError(logId, `Empty upstream SSE (no data frames) from ${resolvedEmail}`);
+      streamReader.cancel().catch(() => {});
+      qwenAbortController?.abort();
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+      lastFailedEmail = resolvedEmail;
+      lastError = new Error(`Qwen returned an empty response (no data frames) for ${resolvedEmail}`);
+      if (resolvedEmail) {
+        try {
+          const { recordAccountFailure } = await import('../services/auth.ts');
+          recordAccountFailure(resolvedEmail);
+        } catch {
+          /* best effort */
+        }
+      }
+      continue;
+      } // end non-JSON empty-stream handling
+    }
+
+    // Reconstruct stream with ALL probed chunks prepended, then pipe remaining data through.
+    // This lets us keep the chunks read during the probe while allowing async consumption.
     stream = new ReadableStream<Uint8Array>({
       async start(controller) {
-        if (!firstChunk.done && firstChunk.value) controller.enqueue(firstChunk.value);
+        for (const chunk of probeChunks) controller.enqueue(chunk);
         try {
           while (true) {
             const { done, value } = await streamReader.read();
@@ -452,6 +661,7 @@ export async function chatCompletions(c: Context) {
       contextCheck.availableTokens!,
       toolCalling,
       logId,
+      contextCheck.estimatedTotalTokens,
     );
 
     const completionId = 'chatcmpl-' + crypto.randomUUID();

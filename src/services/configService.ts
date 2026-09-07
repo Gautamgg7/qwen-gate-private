@@ -30,6 +30,27 @@ export interface ConfigSchema {
   MODELS_CACHE_TTL_MS: string;
   DARK_MODE: string;
   CLAUDE_CODE_PROXY: string;
+  // ── Performance & reliability tuning (v0.8) ──
+  /** Pre-warmed pool: fresh chat sessions kept ready per account. 0 = disabled. */
+  SESSION_POOL_SIZE: string;
+  /** Conversation reuse: max turns before a session is recycled. 0 = one-shot. */
+  SESSION_MAX_TURNS: string;
+  /** How long an idle reused session stays valid before rotation. */
+  SESSION_IDLE_TTL_MS: string;
+  /** Master switch for multi-turn conversation reuse (per client+model). */
+  CONVERSATION_REUSE: string;
+  /** TTL for cached upstream header sets (getBasicHeaders) per account. */
+  HEADER_CACHE_TTL_MS: string;
+  /** Max characters kept inline in the user message before offload. */
+  MAX_INLINE_CHARS: string;
+  /** Above this estimated token count, older turns are summarized (hierarchical). */
+  CONTEXT_COMPRESSION_THRESHOLD: string;
+  /** Approx chunk size per summary pass. */
+  CONTEXT_SUMMARY_CHUNK_TOKENS: string;
+  /** Account success threshold below which an account is marked degraded (0-1). */
+  ACCOUNT_HEALTH_THRESHOLD: string;
+  /** Max number of accounts a single request may try before giving up. */
+  MAX_REQUEST_ACCOUNT_ATTEMPTS: string;
 }
 
 export const DEFAULT_CONFIG: ConfigSchema = {
@@ -59,6 +80,16 @@ export const DEFAULT_CONFIG: ConfigSchema = {
   MODELS_CACHE_TTL_MS: '3600000',
   DARK_MODE: 'false',
   CLAUDE_CODE_PROXY: 'false',
+  SESSION_POOL_SIZE: '2',
+  SESSION_MAX_TURNS: '50',
+  SESSION_IDLE_TTL_MS: '900000',
+  CONVERSATION_REUSE: 'true',
+  HEADER_CACHE_TTL_MS: '60000',
+  MAX_INLINE_CHARS: '120000',
+  CONTEXT_COMPRESSION_THRESHOLD: '150000',
+  CONTEXT_SUMMARY_CHUNK_TOKENS: '20000',
+  ACCOUNT_HEALTH_THRESHOLD: '0.6',
+  MAX_REQUEST_ACCOUNT_ATTEMPTS: '3',
 };
 
 const CONFIG_KEYS = new Set<string>(Object.keys(DEFAULT_CONFIG));

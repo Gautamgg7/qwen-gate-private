@@ -32,6 +32,35 @@ const RATIO_CJK = 1.5;
 const RATIO_DEFAULT = 3.5;
 
 /**
+ * Self-calibration (C1): when Qwen reports real usage, we compare it against our
+ * estimate and adjust a global correction factor. Over time this converges the
+ * heuristic toward Qwen's actual tokenizer, preventing both premature truncation
+ * (quality loss) and window overshoot.
+ */
+let calibrationFactor = 1.0;
+let calibrationSamples = 0;
+const CALIBRATION_MIN_ESTIMATE = 200; // ignore tiny prompts (noise)
+
+export function calibrateTokenEstimator(estimatedTokens: number, actualTokens: number): void {
+  if (!estimatedTokens || !actualTokens) return;
+  if (estimatedTokens < CALIBRATION_MIN_ESTIMATE) return;
+  const ratio = actualTokens / estimatedTokens;
+  // Clamp each sample to avoid a single outlier skewing the factor
+  const clamped = Math.min(3, Math.max(0.33, ratio));
+  calibrationSamples++;
+  const alpha = 1 / Math.min(calibrationSamples, 50); // running average
+  calibrationFactor = calibrationFactor * (1 - alpha) + clamped * alpha;
+}
+
+export function getCalibrationFactor(): number {
+  return calibrationFactor;
+}
+
+export function getCalibrationSamples(): number {
+  return calibrationSamples;
+}
+
+/**
  * Check if a character is CJK (Chinese / Japanese / Korean).
  */
 function isCJK(char: string): boolean {
@@ -108,7 +137,8 @@ export function estimateTokens(
     total += options.messageCount * 5;
   }
 
-  return total;
+  // Apply self-calibration factor (C1) — converges toward Qwen's real tokenizer
+  return Math.ceil(total * calibrationFactor);
 }
 
 /**
@@ -118,7 +148,7 @@ export function estimateTokens(
  */
 export function estimateTokensFast(text: string, options?: { tools?: unknown[] }): number {
   if (!text) return 0;
-  let estimate = Math.ceil(text.length / RATIO_DEFAULT);
+  let estimate = Math.ceil((text.length / RATIO_DEFAULT) * calibrationFactor);
   if (options?.tools?.length) {
     estimate += options.tools.length * 15;
   }

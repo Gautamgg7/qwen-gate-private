@@ -81,9 +81,20 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
       const loopResult = await runStreamLoop(c, reader, streamState, streamCtx, ampState, bufferRef);
 
       if (loopResult.error) {
-        // Upstream went silent — silently terminate stream, log server-side only
+        // Upstream went silent — surface the failure to the client as an SSE
+        // error event BEFORE [DONE]. Writing only [DONE] made clients believe
+        // the response completed normally while generation was cut off.
         logStore.log('debug', 'stream', `[Chat] Stream timeout for ${logId}: ${loopResult.error}`);
         logStore.addError(logId, loopResult.error);
+        try {
+          await streamWriter.write(
+            `data: ${JSON.stringify({
+              error: { message: loopResult.error, type: 'server_error', code: 'upstream_idle_timeout' },
+            })}\n\n`,
+          );
+        } catch {
+          /* client may already be gone — cleanup below still runs */
+        }
         await streamWriter.write('data: [DONE]\n\n');
         logStore.updateEntry(logId, (entry) => {
           if (streamState.reasoningBuffer) entry.reasoningContent = streamState.reasoningBuffer;
@@ -180,6 +191,8 @@ function buildInitialStreamState(finalPrompt: string, initialParentId: string | 
     nextParentId: initialParentId,
     completionTokens: 0,
     promptTokens: Math.ceil(finalPrompt.length / 3.5),
+    /** Pre-request estimate — kept separate so usage feedback can calibrate (C1). */
+    initialPromptTokenEstimate: Math.ceil(finalPrompt.length / 3.5),
     currentThoughtIndex: 0,
     reasoningBuffer: '',
     lastFullContent: '',

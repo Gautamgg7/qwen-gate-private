@@ -596,7 +596,8 @@ async function handleAnthropicStream(
       let hasEmittedContent = false;
       let textBlockIndex = 0;
 
-      const STREAM_IDLE_TIMEOUT = Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 60_000));
+      // 300s default — see streamLoop.ts; Qwen thinking can be silent for minutes
+      const STREAM_IDLE_TIMEOUT = Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 300_000));
 
       while (true) {
         let idleTimer: ReturnType<typeof setTimeout> | undefined;

@@ -5,6 +5,7 @@ import { type AmplificationGuardState, checkAmplificationGuard, getSnapshotDelta
 import { filterContentPipeline, processStreamData, type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
 import { checkFinalAmplification, scheduleCleanup } from './cleanupHelpers.ts';
 import { buildChunkEvent, buildUsage, makeChoice, writeEvent, writeReasoningEvent } from './writeHelpers.ts';
+import { calibrateTokenEstimator } from '../utils/tokenEstimator.ts';
 
 /** Shared TextDecoder — stateless, safe to reuse across streams */
 export const sharedDecoder = new TextDecoder();
@@ -45,11 +46,15 @@ export async function runStreamLoop(
               idleTimedOut = true;
               reject(
                 new Error(
-                  `Upstream stream idle timeout — no data for ${Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 60000)) / 1000}s`,
+                  // 300s default: Qwen max-effort thinking on large agentic
+                  // contexts can be silent for several minutes. A 60s default
+                  // killed healthy streams mid-task (client saw a clean [DONE]
+                  // even though generation was cut off).
+                  `Upstream stream idle timeout — no data for ${Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 300_000)) / 1000}s`,
                 ),
               );
             },
-            Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 60000)),
+            Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 300_000)),
           );
         }),
       ]);
@@ -67,6 +72,7 @@ export async function runStreamLoop(
     const lines = bufferRef.text.split('\n');
     bufferRef.text = lines.pop() || '';
 
+    let sseYieldCounter = 0;
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed || !trimmed.startsWith('data: ')) continue;
@@ -81,11 +87,15 @@ export async function runStreamLoop(
         const chunk = JSON.parse(dataStr);
 
         const result = await processStreamData(chunk, streamState, streamCtx);
-        // Yield to the event loop after each event so Bun gets a socket flush
-        // point per SSE event. Without this, one upstream-batched read with N
-        // complete lines writes all N events back-to-back (0-4ms gaps) — the
-        // client sees "everything at once" instead of a stream.
-        await new Promise((r) => setTimeout(r, 0));
+        // Yield to the event loop every 4th SSE event (B6) — gives Bun socket
+        // flush points while cutting setTimeout(0) overhead 4x vs per-event.
+        // Without any yield, one upstream-batched read with N complete lines
+        // writes all N events back-to-back — the client sees "everything at
+        // once" instead of a stream.
+        sseYieldCounter++;
+        if (sseYieldCounter % 4 === 0) {
+          await new Promise((r) => setTimeout(r, 0));
+        }
         if (result === 'break_stream') {
           streamDone = true;
           break;
@@ -137,6 +147,11 @@ export async function handlePostStreamCompletion(
     includeUsage,
   } = args;
   const { reader, heartbeatInterval, chatId, sessionHeaders, email, sessionPool } = cleanup;
+  // Track whether this stream produced a usable result. A poisoned session
+  // (empty response / upstream error) must NOT be retained for the next
+  // conversation turn — retaining it made every subsequent turn reuse the
+  // broken chat and fail with "empty response" forever.
+  let releaseOk = true;
 
   try {
     // ── Flush partial content FIRST ──────────────────────────────────
@@ -212,11 +227,23 @@ export async function handlePostStreamCompletion(
     // ── Upstream error: emit it AFTER the partial content ────────────
     const upstreamError =
       parseQwenErrorPayload(buffer) || (streamState.upstreamError ? { message: streamState.upstreamError, status: 502 as const } : null);
-    if (upstreamError) {
-      try {
-        require('fs').writeFileSync('/tmp/qwen-error-buffer.json', buffer.slice(0, 10000));
-      } catch {}
+      if (upstreamError) {
       const cleanErrorMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
+      // The session may be in an inconsistent state after an upstream error —
+      // evict it instead of retaining for the next turn.
+      releaseOk = false;
+      // D3: Rate-limit walls delivered inside HTTP 200 bodies — mark the
+      // account so pickAccount skips it, and record the health failure.
+      if (/RateLimited|daily usage limit/i.test(cleanErrorMessage) && resolvedEmail) {
+        try {
+          const { throttleAccount: throttle, recordAccountFailure: recordFail } = await import('../services/auth.ts');
+          throttle(resolvedEmail, 60 * 60 * 1000); // 1 hour cooldown
+          recordFail(resolvedEmail);
+          logStore.log('warn', 'stream', `[D3] Rate-limit wall detected for ${resolvedEmail} — throttled 1h`);
+        } catch {
+          /* best effort — the error is still surfaced to the client */
+        }
+      }
       // Append the error as a final content chunk — the partial answer
       // stays visible, and the user sees why the stream stopped.
       await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({ content: `\n\n[Error] ${cleanErrorMessage}` })]));
@@ -230,7 +257,49 @@ export async function handlePostStreamCompletion(
       return;
     }
 
+    // ── Empty-result guard (FIX) ──────────────────────────────────────
+    // Qwen occasionally "completes" with an HTTP-200 body that produced no
+    // content, no reasoning, and no tool calls (empty body or instant [DONE]).
+    // Without this, OpenCode/agents get a fake successful empty turn. Surface
+    // it as an error so the client retries instead of silently continuing.
+    const emittedAnything =
+      (streamState.lastFullContent || '').trim().length > 0 ||
+      (streamState.reasoningBuffer || '').trim().length > 0 ||
+      effectiveToolCallCount > 0;
+    if (!emittedAnything) {
+      // Poisoned session: evict (releaseOk=false) so the broken chat is NOT
+      // retained for the next conversation turn — retaining it caused every
+      // subsequent turn to reuse the dead chat and fail with the same error.
+      releaseOk = false;
+      const emptyMsg = `Qwen returned an empty response (no content, reasoning, or tool calls) for ${resolvedEmail || '?'}`;
+      logStore.log('warn', 'stream', `[Stream] Empty result for ${logId}: ${emptyMsg}`);
+      logStore.addError(logId, emptyMsg);
+      try {
+        await writeEvent(
+          streamWriter,
+          buildChunkEvent(completionId, model, [makeChoice({ content: `\n\n[Error] ${emptyMsg}` })]),
+        );
+        await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'stop')]));
+      } catch {
+        /* client may be gone */
+      }
+      await streamWriter.write('data: [DONE]\n\n');
+      logStore.updateEntry(logId, (entry) => {
+        entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
+        entry.finalResponse.finishReason = 'empty_response';
+      });
+      logStore.finalizeRequest(logId);
+      return;
+    }
+
     const usage = buildUsage(streamState.promptTokens, streamState.completionTokens, streamState.reasoningBuffer);
+
+    // Self-calibrate the token estimator (C1): compare our pre-request estimate
+    // against Qwen's real reported usage. Converges over ~50 samples.
+    if (streamState.initialPromptTokenEstimate && streamState.promptTokens) {
+      calibrateTokenEstimator(streamState.initialPromptTokenEstimate, streamState.promptTokens);
+    }
+
     const finalFinishReason = effectiveToolCallCount > 0 ? 'tool_calls' : 'stop';
 
     await writeEvent(
@@ -276,7 +345,9 @@ export async function handlePostStreamCompletion(
       /* stream may already be closed */
     }
   } finally {
-    // Always release session to prevent pool exhaustion, even if writeEvent fails
-    scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool);
+    // Always release session to prevent pool exhaustion, even if writeEvent fails.
+    // releaseOk=false evicts the poisoned session (no retention, no warm return,
+    // deleteSession on Qwen's side, recordAccountFailure on the account).
+    scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool, releaseOk);
   }
 }

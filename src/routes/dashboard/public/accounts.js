@@ -133,8 +133,22 @@ function renderAccountsTable(accts) {
 }
 
 /* ── Load Accounts ── */
+var loadAccountsFailed = false;
 async function loadAccounts() {
   var data = await apiFetch('/accounts');
+  if (data === null) {
+    /* Fetch failed or non-OK response — show a clear error instead of an
+       empty table, so a stopped server isn't mistaken for zero accounts. */
+    if (!loadAccountsFailed) {
+      loadAccountsFailed = true;
+      setError('Cannot load accounts — server unreachable. Is Qwen Gate running? Restart it, then refresh this page.');
+    }
+    return;
+  }
+  if (loadAccountsFailed) {
+    loadAccountsFailed = false;
+    setError(null);
+  }
   renderAccountsTable(data);
 }
 

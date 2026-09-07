@@ -13,7 +13,7 @@
 
 import { logCrash, logEvent, logFetchCall } from '../utils/wreqCrashLogger.ts';
 import { extractBxUmidtoken } from './bxTokenExtractor.ts';
-import { generateBxPp, generateBxUa, refreshCookiesViaBrowser } from './fireyejsRunner.ts';
+import { generateBxPp, generateBxUa, refreshCookiesViaBrowser, resetBxUaCache } from './fireyejsRunner.ts';
 import { logStore } from './logStore.ts';
 import { QWEN_API_BASE } from './qwen.ts';
 import { tokenCache } from './tokenCache.ts';
@@ -123,6 +123,42 @@ const wafCheck = (r: Response): boolean => {
   }
   return false;
 };
+
+// ─── WAF-in-body detection ──────────────────────────────────────────────────
+// baxia sometimes bounces with HTTP 200 + application/json body
+// {"ret":["FAIL_SYS_USER_VALIDATE",...]} instead of 302/403/HTML. wafCheck()
+// misses those, the "successful" response carries zero data frames, and the
+// client sees an empty stream. This sniffs the body for the WAF signature.
+const WAF_BODY_RE = /FAIL_SYS_USER_VALIDATE|aliyun_waf/i;
+
+interface WafBodyResult {
+  waf: boolean;
+  response: Response;
+}
+
+async function sniffResponseForWaf(response: Response, isStream: boolean): Promise<WafBodyResult> {
+  if (response.status !== 200) return { waf: false, response };
+  const ct = (response.headers.get('content-type') || '').toLowerCase();
+  // Real SSE streams: don't touch (downstream empty-probe handles those).
+  if (ct.includes('text/event-stream')) return { waf: false, response };
+  // JSON / plain-text body: buffer, sniff, rebuild so the body stays readable.
+  const text = await response.text().catch(() => '');
+  const waf = WAF_BODY_RE.test(text);
+  const cleanHeaders = new Headers(response.headers);
+  cleanHeaders.delete('content-length');
+  cleanHeaders.delete('content-encoding');
+  const rebuilt = new Response(text, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: cleanHeaders,
+  });
+  if (isStream) {
+    (rebuilt as any)._wreqClose = () => {
+      /* worker session is per-request — nothing to close */
+    };
+  }
+  return { waf, response: rebuilt };
+}
 
 /**
  * Make a browserless HTTP request to Qwen API.
@@ -238,7 +274,10 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
         });
         logFetchCall('browserlessFetch.retry', url, method, response.status);
         if (wafCheck(response)) {
-          throw new Error(`WAF challenge persists after cookie refresh for ${url.split('?')[0]}`);
+          tokenCache.delete('bx-ua');
+          tokenCache.delete('bx-pp');
+          resetBxUaCache();
+          throw new Error(`403 WAF challenge persists after cookie refresh for ${url.split('?')[0]} — bx tokens invalidated for retry`);
         }
       }
       if (!freshCookies) {
@@ -257,7 +296,21 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       return response;
     }
 
-    return response;
+    // ─── WAF-in-body sniffing (non-stream) ────────────────────────────
+    // baxia sometimes bounces with HTTP 200 + application/json body
+    // {"ret":["FAIL_SYS_USER_VALIDATE",...]} — wafCheck() above can't see
+    // it. Sniff the buffered body and fail loudly so callers retry with
+    // freshly generated bx tokens instead of parsing a WAF page as data.
+    const sniffed = await sniffResponseForWaf(response, false);
+    if (sniffed.waf) {
+      logStore.log('warn', 'browserless', `WAF-in-body detected on ${url.split('?')[0]} — invalidating bx tokens for fresh retry`);
+      tokenCache.delete('bx-ua');
+      tokenCache.delete('bx-pp');
+      resetBxUaCache();
+      throw new Error(`403 WAF challenge in response body (FAIL_SYS_USER_VALIDATE) for ${url.split('?')[0]} — retry with fresh tokens`);
+    }
+
+    return sniffed.response;
   } catch (err) {
     const elapsed = Date.now() - startTime;
     const msg = err instanceof Error ? err.message : String(err);

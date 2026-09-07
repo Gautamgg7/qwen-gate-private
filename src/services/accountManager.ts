@@ -311,8 +311,20 @@ export async function reloadAccounts(): Promise<void> {
   if (accountWatcher && !watcherReady) {
     return;
   }
-  const discovered = discoverSavedAccounts();
-  const discoveredEmails = new Set(discovered.map((d) => d.email.toLowerCase().trim()));
+  // Discover from BOTH env vars and the persisted accounts file.
+  // discoverSavedAccounts() only reads ACCOUNTn env vars — without merging the
+  // file, the watcher treated every file-based account as "not discovered" and
+  // removed it from memory on each accounts.json change (add/throttle/cookie
+  // save), making the dashboard count flicker between 0/2/3.
+  const seenEmails = new Set<string>();
+  const discovered: Array<{ email: string; password: string }> = [];
+  for (const d of [...discoverSavedAccounts(), ...loadAccountsFromFile()]) {
+    const key = d.email.toLowerCase().trim();
+    if (!key || seenEmails.has(key) || !d.password) continue;
+    seenEmails.add(key);
+    discovered.push({ email: key, password: d.password });
+  }
+  const discoveredEmails = new Set(discovered.map((d) => d.email));
   const existingEmails = new Set(accounts.map((a) => a.email.toLowerCase().trim()));
   let added = 0;
   let removed = 0;
@@ -419,7 +431,83 @@ export function isAvailable(acct: AccountEntry): boolean {
   if (acct.disabled) return false;
   if (!acct.state) return false;
   if (acct.throttledUntil > Date.now()) return false;
+  // Circuit breaker (D4): skip accounts in degraded/down state
+  const health = accountHealth.get(acct.email.toLowerCase().trim());
+  if (health && health.degradedUntil > Date.now()) return false;
   return true;
+}
+
+// ── Account health scoring / circuit breaker (D4) ──────────────────
+// Tracks per-account success/failure in a rolling window. When failures
+// exceed the threshold, the account is marked degraded and temporarily
+// excluded from pickAccount. Successful requests restore it.
+
+interface AccountHealth {
+  successes: number;
+  failures: number;
+  degradedUntil: number;
+  lastFailureAt: number;
+}
+
+const accountHealth = new Map<string, AccountHealth>();
+const HEALTH_WINDOW_MS = 5 * 60 * 1000; // 5-minute rolling window
+const DEGRADED_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
+const DOWN_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+const DEGRADE_THRESHOLD = 3; // consecutive failures → degraded
+const DOWN_THRESHOLD = 5; // consecutive failures → down
+
+function getHealth(email: string): AccountHealth {
+  const key = email.toLowerCase().trim();
+  let h = accountHealth.get(key);
+  if (!h) {
+    h = { successes: 0, failures: 0, degradedUntil: 0, lastFailureAt: 0 };
+    accountHealth.set(key, h);
+  }
+  return h;
+}
+
+export function recordAccountSuccess(email: string): void {
+  const h = getHealth(email);
+  h.successes++;
+  // Decay failures on success — allows auto-recovery
+  if (h.failures > 0) h.failures = Math.max(0, h.failures - 1);
+  if (h.failures < DEGRADE_THRESHOLD && h.degradedUntil > 0) {
+    h.degradedUntil = 0;
+    logStore.log('info', 'account', `[Health] ${email.split('@')[0]} recovered (failures decayed to ${h.failures})`);
+  }
+  // Prune old window entries
+  if (h.lastFailureAt > 0 && Date.now() - h.lastFailureAt > HEALTH_WINDOW_MS) {
+    h.failures = 0;
+  }
+}
+
+export function recordAccountFailure(email: string): void {
+  const h = getHealth(email);
+  h.failures++;
+  h.lastFailureAt = Date.now();
+  const threshold = config.getFloat('ACCOUNT_HEALTH_THRESHOLD', 0.6);
+  // Circuit breaker thresholds scaled by the health threshold config
+  const degradeAt = Math.max(2, Math.round(DEGRADE_THRESHOLD * (1 / Math.max(0.1, threshold))));
+  const downAt = degradeAt + 2;
+  if (h.failures >= downAt) {
+    h.degradedUntil = Date.now() + DOWN_COOLDOWN_MS;
+    logStore.log('warn', 'account', `[Health] ${email.split('@')[0]} marked DOWN (${h.failures} failures) — cooldown ${DOWN_COOLDOWN_MS / 1000}s`);
+  } else if (h.failures >= degradeAt) {
+    h.degradedUntil = Date.now() + DEGRADED_COOLDOWN_MS;
+    logStore.log('warn', 'account', `[Health] ${email.split('@')[0]} marked DEGRADED (${h.failures} failures) — cooldown ${DEGRADED_COOLDOWN_MS / 1000}s`);
+  }
+}
+
+export function getAccountHealthSummary(): Array<{ email: string; failures: number; degraded: boolean; degradedUntil: string | null }> {
+  return getAllAccountEmails().map((email) => {
+    const h = accountHealth.get(email.toLowerCase().trim());
+    return {
+      email,
+      failures: h?.failures || 0,
+      degraded: !!h && h.degradedUntil > Date.now(),
+      degradedUntil: h?.degradedUntil && h.degradedUntil > Date.now() ? new Date(h.degradedUntil).toISOString() : null,
+    };
+  });
 }
 export async function pickAccount(excludeEmail?: string): Promise<AccountEntry | null> {
   // No lock needed — all operations are synchronous and fast.

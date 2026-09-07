@@ -174,10 +174,15 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   const featureConfig = buildFeatureConfig(true);
 
   if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
+    // E1: Sort tools alphabetically for a stable prefix — helps model
+    // compliance and any server-side caching (identical prefix → cache hit).
+    const sortedTools = [...body.tools].sort((a: any, b: any) =>
+      (a.function?.name || a.name || '').localeCompare(b.function?.name || b.name || ''),
+    );
     const localMcp: Record<string, any> = {};
     localMcp['★'] = {};
     const toolNames: string[] = [];
-    for (const t of body.tools) {
+    for (const t of sortedTools) {
       const fn = t.function || {};
       localMcp['★'][fn.name] = {
         description: fn.description || '',
@@ -188,7 +193,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
     featureConfig.local_mcp = localMcp;
     // ponytail: tool schema in system prompt as textual fallback for models
     // that don't honor feature_config.local_mcp consistently
-    const toolDescriptions = body.tools
+    const toolDescriptions = sortedTools
       .map((t: any) => {
         const fn = t.function || {};
         const params = fn.parameters?.properties ? Object.keys(fn.parameters.properties).join(', ') : '';
@@ -235,12 +240,9 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 export async function handleImageModelFallback(body: any, messages: any[]): Promise<void> {
   const hasImages = messages.some((m: any) => Array.isArray(m.content) && m.content.some((c: any) => c.type === 'image_url'));
   if (hasImages) {
-    const modelId = (body.model as string)
-      .toLowerCase()
-      .replace(/\./g, '-')
-      .replace(/-no-thinking$/, '');
+    const canonKey = modelCanonKey(String(body.model).replace(/-no-thinking$/, ''));
     const models = await fetchQwenModels();
-    const specs = models.find((m: any) => m.id === modelId || m.id === body.model);
+    const specs = models.find((m: any) => typeof m.id === 'string' && modelCanonKey(m.id) === canonKey);
     const supportsImages = specs?.modalities?.includes('image');
     if (!supportsImages) {
       const original = body.model;
@@ -250,21 +252,56 @@ export async function handleImageModelFallback(body: any, messages: any[]): Prom
 }
 
 export async function getModelSpecs(body: any): Promise<{ maxContext: number; maxOutput: number }> {
-  const modelId = (body.model as string)
-    .toLowerCase()
-    .replace(/\./g, '-')
-    .replace(/-no-thinking$/, '');
   const models = await fetchQwenModels();
-  const specs = models.find((m: any) => m.id === modelId || m.id === body.model);
+  const canonKey = modelCanonKey(body.model);
+  const specs = models.find((m: any) => typeof m.id === 'string' && modelCanonKey(m.id) === canonKey);
   return {
     maxContext: specs?.context_window || 250000,
     maxOutput: specs?.max_output_tokens || 65000,
   };
 }
 
+/**
+ * Canonical form of a model name for comparison: lowercase, dots/underscores/
+ * whitespace collapsed to dashes, "-no-thinking" suffix kept as-is.
+ */
+function modelCanonKey(name: unknown): string {
+  return String(name ?? '')
+    .toLowerCase()
+    .replace(/[._\s]+/g, '-');
+}
+
+/**
+ * Resolve a client-provided model name to Qwen's exact catalog ID.
+ * Clients (OpenCode, Cursor, …) often send display names like "Qwen3.8-Max"
+ * or provider-prefixed ids like "qwen/qwen3.8-max". Qwen's upstream API only
+ * accepts the exact catalog ID (e.g. "qwen3.8-max") and rejects anything else
+ * with "Not_Found: Model not found", so match case- and separator-
+ * insensitively against the live model catalog.
+ */
+export async function resolveModelName(raw: unknown): Promise<string> {
+  if (typeof raw !== 'string' || raw.trim() === '') return raw as string;
+  let name = raw.trim();
+  // Strip a provider prefix ("qwen/qwen3.8-max" → "qwen3.8-max")
+  const slashIdx = name.lastIndexOf('/');
+  if (slashIdx > 0) name = name.slice(slashIdx + 1).trim();
+  const hasNoThinking = name.endsWith('-no-thinking');
+  const base = hasNoThinking ? name.slice(0, -'-no-thinking'.length) : name;
+  const canonKey = modelCanonKey(base);
+  try {
+    const models = await fetchQwenModels();
+    const match = models.find((m: any) => typeof m?.id === 'string' && modelCanonKey(m.id) === canonKey);
+    if (match) return match.id + (hasNoThinking ? '-no-thinking' : '');
+  } catch {
+    /* catalog unavailable — fall through to a normalized guess */
+  }
+  return base.toLowerCase() + (hasNoThinking ? '-no-thinking' : '');
+}
+
 export async function acquireSessionWithCorrections(
   accountEmail: string | undefined,
   qwenMessages: QwenMessage[],
+  conversationKey?: string,
 ): Promise<{
   session: any;
   qwenMessages: QwenMessage[];
@@ -272,7 +309,7 @@ export async function acquireSessionWithCorrections(
   sessionHeaders: any;
   resolvedEmail: string;
 }> {
-  const session = await sessionPool.acquire(accountEmail);
+  const session = await sessionPool.acquire(accountEmail, { conversationKey });
   const prevCorrections =
     pendingCorrections.get(session.chatId) ||
     (accountEmail ? pendingCorrections.get(accountEmail) : undefined) ||
